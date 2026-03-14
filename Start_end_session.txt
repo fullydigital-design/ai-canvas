@@ -1,0 +1,11 @@
+Start every session with:
+Read AGENTS.md, project-state.yaml, docs/PROJECT_STATUS.md, docs/KNOWN_ISSUES.md first.
+
+
+end session
+
+Quality gates for every Codex task
+Before closing task, require:
+relevant build/check command passes
+no obvious console/runtime error
+docs updated (CHANGELOG, KNOWN_ISSUES, project-state.yaml) if behavior changed

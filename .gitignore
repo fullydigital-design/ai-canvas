@@ -1,0 +1,11 @@
+node_modules/
+dist/
+electron-dist/
+release/
+*.log
+desktop.ini
+*.exe
+*.dmg
+*.AppImage
+*.deb
+.DS_Store

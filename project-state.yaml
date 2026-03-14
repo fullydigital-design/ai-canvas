@@ -1,0 +1,44 @@
+project:
+  name: "AI Canvas Editor"
+  phase: "stabilization"
+  status: "working_with_known_issues"
+  last_updated: "2026-03-14"
+
+runtime:
+  frontend:
+    framework: "React 18 + TypeScript + Vite"
+  desktop:
+    framework: "Electron"
+    main_entry: "electron/main.cjs"
+    preload_entry: "electron/preload.cjs"
+
+versions:
+  package_version: "1.0.0"
+  release_scheme: "release-<major>.<minor2>.<sequence2>"
+  latest_release_label: "release-1.00.02"
+  latest_release_artifact: "release/release-1.00.02/AI-Canvas-Editor-v1-Portable.exe"
+
+scripts:
+  launch_dev_bat: "start_launch_app.bat"
+  build_portable_bat: "build_portable.bat"
+  npm:
+    dev: "pnpm dev"
+    build: "pnpm build"
+    electron_dev: "pnpm electron:dev"
+
+quality:
+  automated_tests: false
+  smoke_checklist: "docs/TESTING_CHECKLIST.md"
+
+known_issues:
+  - "release/win-unpacked may remain due to Windows lock"
+  - "title separator text can render incorrectly (encoding issue)"
+  - "no automated regression suite"
+
+source_of_truth:
+  agents_guide: "AGENTS.md"
+  project_status: "docs/PROJECT_STATUS.md"
+  architecture: "docs/ARCHITECTURE.md"
+  known_issues: "docs/KNOWN_ISSUES.md"
+  changelog: "docs/CHANGELOG.md"
+  release_history: "docs/RELEASE_HISTORY.md"
