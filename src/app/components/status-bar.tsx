@@ -2,8 +2,9 @@
  * Status Bar — shows cursor position, zoom, canvas size, active tool,
  * active layer info, selection dimensions, and sampled color.
  */
-import { useEditor, type Tool } from "./editor-store";
+import { type Tool, useEditorSelector } from "./editor-store";
 import { useState, useEffect } from "react";
+import { useShallow } from "zustand/react/shallow";
 
 const TOOL_LABELS: Record<Tool, string> = {
   select: "Select",
@@ -37,7 +38,19 @@ export function StatusBar() {
     selection,
     brushSize,
     brushColor,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      activeTool: s.activeTool,
+      canvasZoom: s.canvasZoom,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      activeLayerId: s.activeLayerId,
+      layers: s.layers,
+      selection: s.selection,
+      brushSize: s.brushSize,
+      brushColor: s.brushColor,
+    }))
+  );
 
   // Listen for mouse position events dispatched from InfiniteCanvas
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });

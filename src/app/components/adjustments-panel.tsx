@@ -10,7 +10,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 import {
-  useEditor,
+  useEditorSelector,
   type LayerAdjustments,
   type CurvePoint,
   DEFAULT_LEVELS,
@@ -20,6 +20,7 @@ import {
   DEFAULT_BLUR_SHARPEN,
 } from "./editor-store";
 import { hasActiveAdjustments } from "./adjustment-utils";
+import { useShallow } from "zustand/react/shallow";
 
 type AdjustmentTab =
   | "levels"
@@ -329,7 +330,15 @@ function ColorBalanceSection({
 
 // ─── Main Adjustments Panel ───────────────────────────────────────────
 export function AdjustmentsPanel() {
-  const { layers, activeLayerId, updateLayer, updateLayerSilent, pushHistory } = useEditor();
+  const { layers, activeLayerId, updateLayer, updateLayerSilent, pushHistory } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      activeLayerId: s.activeLayerId,
+      updateLayer: s.updateLayer,
+      updateLayerSilent: s.updateLayerSilent,
+      pushHistory: s.pushHistory,
+    }))
+  );
   const [openSections, setOpenSections] = useState<Record<AdjustmentTab, boolean>>({
     levels: true,
     curves: false,

@@ -18,7 +18,7 @@ export type GeminiModelType = "image" | "video";
 
 export interface GeminiModelEntry {
   id: string; // unique key
-  modelId: string; // API model ID e.g. "gemini-2.0-flash-image-preview"
+  modelId: string; // API model ID e.g. "gemini-3.1-flash-image-preview"
   displayName: string; // e.g. "Gemini 2.0 Flash"
   type: GeminiModelType;
   isDefault?: boolean;
@@ -29,24 +29,74 @@ const STORAGE_KEY = "ai-canvas-gemini-models";
 const BUILT_IN_MODELS: GeminiModelEntry[] = [
   {
     id: "builtin-1",
-    modelId: "gemini-2.0-flash-exp",
-    displayName: "Gemini 2.0 Flash (Image Gen)",
+    modelId: "gemini-3.1-flash-image-preview",
+    displayName: "Nana Banana 2",
     type: "image",
     isDefault: true,
   },
   {
     id: "builtin-2",
-    modelId: "gemini-1.5-pro",
-    displayName: "Gemini 1.5 Pro",
-    type: "image",
-  },
-  {
-    id: "builtin-3",
-    modelId: "gemini-1.5-flash",
-    displayName: "Gemini 1.5 Flash",
+    modelId: "gemini-3-pro-image-preview",
+    displayName: "Nana Banana Pro",
     type: "image",
   },
 ];
+
+const REMOVED_MODEL_IDS = new Set([
+  "gemini-2.0-flash-exp",
+  "gemini-1.5-pro",
+  "gemini-1.5-flash",
+]);
+
+function isValidModelType(value: unknown): value is GeminiModelType {
+  return value === "image" || value === "video";
+}
+
+function normalizeModels(input: unknown): GeminiModelEntry[] {
+  const rawList = Array.isArray(input) ? input : [];
+  const sanitized: GeminiModelEntry[] = [];
+
+  for (const raw of rawList) {
+    if (!raw || typeof raw !== "object") continue;
+    const rec = raw as Record<string, unknown>;
+    const modelId = typeof rec.modelId === "string" ? rec.modelId.trim() : "";
+    if (!modelId || REMOVED_MODEL_IDS.has(modelId)) continue;
+    const displayName = typeof rec.displayName === "string" ? rec.displayName.trim() : modelId;
+    const type: GeminiModelType = isValidModelType(rec.type) ? rec.type : "image";
+    const id =
+      typeof rec.id === "string" && rec.id.trim().length > 0
+        ? rec.id
+        : `model-${Math.random().toString(36).slice(2, 8)}`;
+    sanitized.push({
+      id,
+      modelId,
+      displayName: displayName || modelId,
+      type,
+      isDefault: false,
+    });
+  }
+
+  const byModelId = new Map(sanitized.map((m) => [m.modelId, m] as const));
+  const next: GeminiModelEntry[] = BUILT_IN_MODELS.map((base, index) => {
+    const existing = byModelId.get(base.modelId);
+    return {
+      ...base,
+      ...(existing || {}),
+      id: base.id,
+      modelId: base.modelId,
+      displayName: existing?.displayName || base.displayName,
+      type: existing?.type || base.type,
+      isDefault: index === 0,
+    };
+  });
+
+  for (const m of sanitized) {
+    if (next.some((x) => x.modelId === m.modelId)) continue;
+    next.push({ ...m, isDefault: false });
+  }
+
+  return next;
+}
 
 // ─── Hook: useGeminiModels ─────────────────────────────────────────
 
@@ -56,10 +106,11 @@ export function useGeminiModels() {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (stored) {
         const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        const normalized = normalizeModels(parsed);
+        if (normalized.length > 0) return normalized;
       }
     } catch {}
-    return BUILT_IN_MODELS;
+    return normalizeModels(BUILT_IN_MODELS);
   });
 
   // Persist to localStorage on change
@@ -69,16 +120,21 @@ export function useGeminiModels() {
 
   const addModel = useCallback(
     (modelId: string, displayName: string, type: GeminiModelType) => {
-      const entry: GeminiModelEntry = {
-        id: `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        modelId: modelId.trim(),
-        displayName: displayName.trim() || modelId.trim(),
-        type,
-        isDefault: models.length === 0,
-      };
-      setModels((prev) => [...prev, entry]);
+      const trimmedId = modelId.trim();
+      if (!trimmedId || REMOVED_MODEL_IDS.has(trimmedId)) return;
+      setModels((prev) => {
+        if (prev.some((m) => m.modelId === trimmedId)) return prev;
+        const entry: GeminiModelEntry = {
+          id: `custom-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          modelId: trimmedId,
+          displayName: displayName.trim() || trimmedId,
+          type,
+          isDefault: false,
+        };
+        return [...prev, entry];
+      });
     },
-    [models.length]
+    []
   );
 
   const removeModel = useCallback((id: string) => {
@@ -115,7 +171,7 @@ export function useGeminiModels() {
   }, [models]);
 
   const resetToDefaults = useCallback(() => {
-    setModels(BUILT_IN_MODELS);
+    setModels(normalizeModels(BUILT_IN_MODELS));
   }, []);
 
   return {
@@ -312,7 +368,7 @@ export function GeminiModelManagerPanel({
               <input
                 value={newModelId}
                 onChange={(e) => setNewModelId(e.target.value)}
-                placeholder="Model ID (e.g. gemini-2.0-flash-exp)"
+                placeholder="Model ID (e.g. gemini-3.1-flash-image-preview)"
                 className="flex-1 bg-secondary text-foreground text-[11px] font-mono rounded-md px-2 py-1.5 border border-border focus:border-primary focus:outline-none placeholder:text-muted-foreground/50"
               />
               <input

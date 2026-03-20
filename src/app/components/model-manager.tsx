@@ -22,7 +22,7 @@ import {
   Check,
 } from "lucide-react";
 import { getComfyClient } from "./comfyui-client";
-import { useEditor } from "./editor-store";
+import { useEditorSelector } from "./editor-store";
 
 type ModelCategory = "checkpoints" | "loras" | "vae" | "upscale" | "controlnet" | "embeddings" | "clip";
 
@@ -50,7 +50,7 @@ interface ModelManagerProps {
 }
 
 export function ModelManager({ open, onClose }: ModelManagerProps) {
-  const { comfyuiUrl } = useEditor();
+  const comfyuiUrl = useEditorSelector((s) => s.comfyuiUrl);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

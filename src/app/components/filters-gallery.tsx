@@ -20,7 +20,8 @@ import {
   CircleDot,
   Layers,
 } from "lucide-react";
-import { useEditor, type FilterPreset, type FilterType, type LayerAdjustments } from "./editor-store";
+import { useEditorSelector, type FilterPreset, type FilterType, type LayerAdjustments } from "./editor-store";
+import { useShallow } from "zustand/react/shallow";
 
 const FILTER_CATALOG: {
   type: FilterType;
@@ -49,8 +50,17 @@ interface FiltersGalleryProps {
 }
 
 export function FiltersGallery({ open, onClose }: FiltersGalleryProps) {
-  const { layers, activeLayerId, updateLayer, updateLayerSilent, pushHistory } = useEditor();
+  const { layers, activeLayerId, updateLayer, updateLayerSilent, pushHistory } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      activeLayerId: s.activeLayerId,
+      updateLayer: s.updateLayer,
+      updateLayerSilent: s.updateLayerSilent,
+      pushHistory: s.pushHistory,
+    }))
+  );
   const [view, setView] = useState<"gallery" | "active">("gallery");
+  const [backdropMode, setBackdropMode] = useState<"focus" | "preview" | "clear">("preview");
 
   const activeLayer = layers.find((l) => l.id === activeLayerId);
   const activeFilters = activeLayer?.adjustments?.filters || [];
@@ -109,8 +119,15 @@ export function FiltersGallery({ open, onClose }: FiltersGalleryProps) {
 
   if (!open) return null;
 
+  const backdropClass =
+    backdropMode === "focus"
+      ? "bg-black/55 backdrop-blur-sm"
+      : backdropMode === "preview"
+      ? "bg-black/22"
+      : "bg-black/8";
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div className={`fixed inset-0 z-50 flex items-center justify-center ${backdropClass}`}>
       <div className="bg-card border border-border rounded-xl shadow-2xl w-[640px] max-h-[80vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border">
@@ -119,6 +136,42 @@ export function FiltersGallery({ open, onClose }: FiltersGalleryProps) {
             <span className="text-foreground">Filters Gallery</span>
           </div>
           <div className="flex items-center gap-2">
+            {/* Background visibility */}
+            <div className="flex rounded-md border border-border overflow-hidden">
+              <button
+                onClick={() => setBackdropMode("focus")}
+                className={`px-2.5 py-1 text-[10px] transition-colors ${
+                  backdropMode === "focus"
+                    ? "bg-primary/15 text-primary"
+                    : "bg-secondary text-muted-foreground hover:text-foreground"
+                }`}
+                title="Focus mode (darker + blur)"
+              >
+                Focus
+              </button>
+              <button
+                onClick={() => setBackdropMode("preview")}
+                className={`px-2.5 py-1 text-[10px] transition-colors ${
+                  backdropMode === "preview"
+                    ? "bg-primary/15 text-primary"
+                    : "bg-secondary text-muted-foreground hover:text-foreground"
+                }`}
+                title="Preview mode (lighter dim)"
+              >
+                Preview
+              </button>
+              <button
+                onClick={() => setBackdropMode("clear")}
+                className={`px-2.5 py-1 text-[10px] transition-colors ${
+                  backdropMode === "clear"
+                    ? "bg-primary/15 text-primary"
+                    : "bg-secondary text-muted-foreground hover:text-foreground"
+                }`}
+                title="Clear mode (minimal dim)"
+              >
+                Clear
+              </button>
+            </div>
             {/* View tabs */}
             <div className="flex rounded-md border border-border overflow-hidden">
               <button

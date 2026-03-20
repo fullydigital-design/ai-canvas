@@ -22,3 +22,4 @@ Last updated: 2026-03-14
 
 ## Notes
 - Legacy `release/win-unpacked` can remain due to file lock and is not part of versioned history.
+- Release process runbook: `docs/RELEASE_RUNBOOK.md`.

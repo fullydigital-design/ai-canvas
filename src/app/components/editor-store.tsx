@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useCallback, useRef, type ReactNode } from "react";
+import { create } from "zustand";
+import { imageCache, generateImageRef } from "./image-cache";
 
 export interface LevelsAdjustment {
   inputBlack: number;   // 0-255
@@ -53,6 +54,17 @@ export interface LayerAdjustments {
   filters?: FilterPreset[];
 }
 
+export type BlenderPassType =
+  | "beauty"
+  | "depth"
+  | "normal"
+  | "albedo"
+  | "object_id"
+  | "material_id"
+  | "custom";
+
+export type LayerSourceMetadata = Record<string, string | number | boolean | null>;
+
 export interface FilterPreset {
   id: string;
   type: FilterType;
@@ -106,13 +118,19 @@ export interface Layer {
   locked: boolean;
   opacity: number;
   type: "image" | "fill" | "ai-generated" | "mask" | "text";
-  imageData?: string; // base64 data URL
+  /** Cache key into the global ImageCache (preferred). */
+  imageRef?: string;
+  /** @deprecated Legacy base64 data URL — use imageRef + ImageCache instead. */
+  imageData?: string;
   blendMode: string;
   x: number;
   y: number;
   width: number;
   height: number;
-  maskData?: string; // base64 mask (white=show, black=hide)
+  /** Cache key for mask data in ImageCache. */
+  maskRef?: string;
+  /** @deprecated Legacy base64 mask — use maskRef + ImageCache instead. */
+  maskData?: string;
   maskEnabled?: boolean;
   fillColor?: string; // hex color for fill layers (default: #ffffff)
   adjustments?: LayerAdjustments;
@@ -125,6 +143,49 @@ export interface Layer {
   textBold?: boolean;
   textItalic?: boolean;
   textLineHeight?: number;
+  blenderImportId?: string;
+  blenderGroupId?: string;
+  blenderGroupName?: string;
+  blenderPassType?: BlenderPassType;
+  sourceMetadata?: LayerSourceMetadata;
+}
+
+/**
+ * Resolve a layer's image data URL. Prefers imageRef (cache) over legacy imageData.
+ */
+export function getLayerImageDataUrl(layer: Layer): string | undefined {
+  if (layer.imageRef) return imageCache.getDataUrl(layer.imageRef);
+  return layer.imageData;
+}
+
+/**
+ * Resolve a layer's image element from cache. Works for both imageRef and legacy imageData.
+ */
+export function getLayerImageElement(layer: Layer): HTMLImageElement | undefined {
+  if (layer.imageRef) return imageCache.getElement(layer.imageRef);
+  return undefined; // legacy layers use per-component imageCache state
+}
+
+/**
+ * Resolve a layer's mask data URL. Prefers maskRef (cache) over legacy maskData.
+ */
+export function getLayerMaskDataUrl(layer: Layer): string | undefined {
+  if (layer.maskRef) return imageCache.getDataUrl(layer.maskRef);
+  return layer.maskData;
+}
+
+/**
+ * Check if a layer has image content (either via cache ref or legacy data).
+ */
+export function layerHasImage(layer: Layer): boolean {
+  return !!(layer.imageRef || layer.imageData);
+}
+
+/**
+ * Check if a layer has mask content (either via cache ref or legacy data).
+ */
+export function layerHasMask(layer: Layer): boolean {
+  return !!(layer.maskRef || layer.maskData);
 }
 
 export interface SelectionPath {
@@ -171,7 +232,7 @@ interface HistorySnapshot {
 
 const MAX_HISTORY = 50;
 
-interface EditorState {
+export interface EditorState {
   layers: Layer[];
   activeLayerId: string | null;
   activeTool: Tool;
@@ -199,7 +260,7 @@ interface EditorState {
   historyLength: number;
 }
 
-interface EditorActions {
+export interface EditorActions {
   setLayers: (layers: Layer[]) => void;
   addLayer: (layer: Layer) => void;
   removeLayer: (id: string) => void;
@@ -235,13 +296,65 @@ interface EditorActions {
   updateLayerSilent: (id: string, updates: Partial<Layer>) => void;
   /** Set layers WITHOUT pushing to undo history (for project load, etc.) */
   setLayersSilent: (layers: Layer[]) => void;
+  /** Store image data in cache, set layer.imageRef (pushes history). */
+  updateLayerImage: (layerId: string, dataUrl: string) => void;
+  /** Store mask data in cache, set layer.maskRef (pushes history). */
+  updateLayerMask: (layerId: string, dataUrl: string) => void;
 }
 
-const noop = (() => {}) as any;
+const INITIAL_BG: Layer = {
+  id: "bg-1",
+  name: "Background",
+  visible: true,
+  locked: false,
+  opacity: 100,
+  type: "fill",
+  blendMode: "normal",
+  x: 0,
+  y: 0,
+  width: 1024,
+  height: 1024,
+  fillColor: "#ffffff",
+};
 
-const defaultState: EditorState & EditorActions = {
-  layers: [],
-  activeLayerId: null,
+// ─── Undo/Redo History (module-level, outside store to avoid serialization) ──
+let _history: HistorySnapshot[] = [
+  { layers: [INITIAL_BG], activeLayerId: "bg-1" },
+];
+let _historyIndex = 0;
+
+/** Collect all imageRef/maskRef keys referenced by current state + history. */
+function _collectActiveRefs(currentLayers: Layer[]): Set<string> {
+  const refs = new Set<string>();
+  const addLayerRefs = (l: Layer) => {
+    if (l.imageRef) refs.add(l.imageRef);
+    if (l.maskRef) refs.add(l.maskRef);
+  };
+  currentLayers.forEach(addLayerRefs);
+  _history.forEach((snap) => snap.layers.forEach(addLayerRefs));
+  return refs;
+}
+
+/** Prune cache entries not referenced by any history snapshot or current state. */
+function _gcImageCache(currentLayers: Layer[]) {
+  const active = _collectActiveRefs(currentLayers);
+  imageCache.gc(active);
+}
+
+function _updateUndoRedoFlags(set: (partial: Partial<EditorState>) => void) {
+  set({
+    canUndo: _historyIndex > 0,
+    canRedo: _historyIndex < _history.length - 1,
+    historyIndex: _historyIndex,
+    historyLength: _history.length,
+  });
+}
+
+// ─── Zustand Store ───────────────────────────────────────────────────────────
+export const useEditorStore = create<EditorState & EditorActions>()((set, get) => ({
+  // ── State ──────────────────────────────────────────────────
+  layers: [INITIAL_BG],
+  activeLayerId: "bg-1",
   activeTool: "move",
   selection: null,
   canvasOffset: { x: 0, y: 0 },
@@ -265,230 +378,181 @@ const defaultState: EditorState & EditorActions = {
   cropAspectRatio: null,
   historyIndex: 0,
   historyLength: 1,
-  setLayers: noop,
-  addLayer: noop,
-  removeLayer: noop,
-  updateLayer: noop,
-  reorderLayers: noop,
-  setActiveLayerId: noop,
-  setActiveTool: noop,
-  setSelection: noop,
-  setCanvasOffset: noop,
-  setCanvasZoom: noop,
-  setCanvasSize: noop,
-  setCanvasDimensions: noop,
-  setBrushSize: noop,
-  setBrushColor: noop,
-  setBrushHardness: noop,
-  setEditingMaskLayerId: noop,
-  addMaskToLayer: noop,
-  removeMaskFromLayer: noop,
-  setGeminiApiKey: noop,
-  setComfyuiUrl: noop,
-  setGenerationPrompt: noop,
-  setIsGenerating: noop,
-  undo: noop,
-  redo: noop,
-  pushHistory: noop,
-  setMagicWandTolerance: noop,
-  setMagicWandContiguous: noop,
-  setGradientEndColor: noop,
-  setGradientMode: noop,
-  setCropAspectRatio: noop,
-  jumpToHistory: noop,
-  updateLayerSilent: noop,
-  setLayersSilent: noop,
-};
 
-const EditorContext = createContext<EditorState & EditorActions>(defaultState);
+  // ── Actions ────────────────────────────────────────────────
 
-const INITIAL_BG: Layer = {
-  id: "bg-1",
-  name: "Background",
-  visible: true,
-  locked: false,
-  opacity: 100,
-  type: "fill",
-  blendMode: "normal",
-  x: 0,
-  y: 0,
-  width: 1024,
-  height: 1024,
-  fillColor: "#ffffff",
-};
+  pushHistory: () => {
+    const { layers, activeLayerId } = get();
+    const snapshot: HistorySnapshot = {
+      layers: layers.map((l) => ({ ...l })),
+      activeLayerId,
+    };
+    _history.splice(_historyIndex + 1);
+    _history.push(snapshot);
+    if (_history.length > MAX_HISTORY) {
+      _history.shift();
+      // GC image cache after discarding old history entries
+      _gcImageCache(layers);
+    } else {
+      _historyIndex++;
+    }
+    _updateUndoRedoFlags(set);
+  },
 
-export function EditorProvider({ children }: { children: ReactNode }) {
-  const [layers, setLayersRaw] = useState<Layer[]>([INITIAL_BG]);
-  const [activeLayerId, setActiveLayerIdRaw] = useState<string | null>("bg-1");
-  const [activeTool, setActiveTool] = useState<Tool>("move");
-  const [selection, setSelection] = useState<Selection | null>(null);
-  const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 });
-  const [canvasZoom, setCanvasZoom] = useState(1);
-  const [canvasWidth, setCanvasWidth] = useState(1024);
-  const [canvasHeight, setCanvasHeight] = useState(1024);
-  const [brushSize, setBrushSize] = useState(30);
-  const [brushColor, setBrushColor] = useState("#3ECF8E");
-  const [brushHardness, setBrushHardness] = useState(80);
-  const [editingMaskLayerId, setEditingMaskLayerId] = useState<string | null>(null);
-  const [geminiApiKey, setGeminiApiKey] = useState("");
-  const [comfyuiUrl, setComfyuiUrl] = useState("http://localhost:8188");
-  const [generationPrompt, setGenerationPrompt] = useState("");
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [magicWandTolerance, setMagicWandTolerance] = useState(30);
-  const [magicWandContiguous, setMagicWandContiguous] = useState(true);
-  const [gradientEndColor, setGradientEndColor] = useState("#000000");
-  const [gradientMode, setGradientMode] = useState<GradientMode>("linear");
-  const [cropAspectRatio, setCropAspectRatio] = useState<CropAspectRatio>(null);
-
-  // ─── Undo/Redo History ────────────────────────────────────────
-  const historyRef = useRef<HistorySnapshot[]>([
-    { layers: [INITIAL_BG], activeLayerId: "bg-1" },
-  ]);
-  const historyIndexRef = useRef(0);
-  const [canUndo, setCanUndo] = useState(false);
-  const [canRedo, setCanRedo] = useState(false);
-
-  const updateUndoRedoState = useCallback(() => {
-    setCanUndo(historyIndexRef.current > 0);
-    setCanRedo(historyIndexRef.current < historyRef.current.length - 1);
-  }, []);
-
-  // Push current state to history (called BEFORE making a change)
-  const pushHistory = useCallback(() => {
-    setLayersRaw((currentLayers) => {
-      setActiveLayerIdRaw((currentActiveId) => {
-        const snapshot: HistorySnapshot = {
-          layers: currentLayers.map((l) => ({ ...l })),
-          activeLayerId: currentActiveId,
-        };
-        // Truncate any future history beyond current index
-        const history = historyRef.current;
-        history.splice(historyIndexRef.current + 1);
-        history.push(snapshot);
-        // Cap size
-        if (history.length > MAX_HISTORY) {
-          history.shift();
-        } else {
-          historyIndexRef.current++;
-        }
-        updateUndoRedoState();
-        return currentActiveId;
+  undo: () => {
+    if (_historyIndex <= 0) return;
+    const { layers, activeLayerId } = get();
+    // If at the tip, save current state so we can redo back to it
+    if (_historyIndex === _history.length - 1) {
+      _history.push({
+        layers: layers.map((l) => ({ ...l })),
+        activeLayerId,
       });
-      return currentLayers;
+      if (_history.length > MAX_HISTORY + 1) _history.shift();
+    }
+    _historyIndex--;
+    const snapshot = _history[_historyIndex];
+    set({
+      layers: snapshot.layers.map((l) => ({ ...l })),
+      activeLayerId: snapshot.activeLayerId,
     });
-  }, [updateUndoRedoState]);
+    _updateUndoRedoFlags(set);
+  },
 
-  const undo = useCallback(() => {
-    if (historyIndexRef.current <= 0) return;
-    // Save current state as future
-    setLayersRaw((currentLayers) => {
-      setActiveLayerIdRaw((currentActiveId) => {
-        const history = historyRef.current;
-        // If we're at the tip, push current state so we can redo back to it
-        if (historyIndexRef.current === history.length - 1) {
-          history.push({
-            layers: currentLayers.map((l) => ({ ...l })),
-            activeLayerId: currentActiveId,
-          });
-          if (history.length > MAX_HISTORY + 1) history.shift();
-        }
-        historyIndexRef.current--;
-        const snapshot = history[historyIndexRef.current];
-        // Defer actual state update
-        setTimeout(() => {
-          setLayersRaw(snapshot.layers.map((l) => ({ ...l })));
-          setActiveLayerIdRaw(snapshot.activeLayerId);
-          updateUndoRedoState();
-        }, 0);
-        return currentActiveId;
-      });
-      return currentLayers;
+  redo: () => {
+    if (_historyIndex >= _history.length - 1) return;
+    _historyIndex++;
+    const snapshot = _history[_historyIndex];
+    set({
+      layers: snapshot.layers.map((l) => ({ ...l })),
+      activeLayerId: snapshot.activeLayerId,
     });
-  }, [updateUndoRedoState]);
+    _updateUndoRedoFlags(set);
+  },
 
-  const redo = useCallback(() => {
-    const history = historyRef.current;
-    if (historyIndexRef.current >= history.length - 1) return;
-    historyIndexRef.current++;
-    const snapshot = history[historyIndexRef.current];
-    setLayersRaw(snapshot.layers.map((l) => ({ ...l })));
-    setActiveLayerIdRaw(snapshot.activeLayerId);
-    updateUndoRedoState();
-  }, [updateUndoRedoState]);
+  jumpToHistory: (index: number) => {
+    if (index < 0 || index >= _history.length) return;
+    _historyIndex = index;
+    const snapshot = _history[_historyIndex];
+    set({
+      layers: snapshot.layers.map((l) => ({ ...l })),
+      activeLayerId: snapshot.activeLayerId,
+    });
+    _updateUndoRedoFlags(set);
+  },
 
-  const jumpToHistory = useCallback((index: number) => {
-    const history = historyRef.current;
-    if (index < 0 || index >= history.length) return;
-    historyIndexRef.current = index;
-    const snapshot = history[historyIndexRef.current];
-    setLayersRaw(snapshot.layers.map((l) => ({ ...l })));
-    setActiveLayerIdRaw(snapshot.activeLayerId);
-    updateUndoRedoState();
-  }, [updateUndoRedoState]);
+  setLayers: (newLayers: Layer[]) => {
+    get().pushHistory();
+    set({ layers: newLayers });
+  },
 
-  // Wrapped setters that auto-push history for layer-modifying ops
-  const setLayers = useCallback((newLayers: Layer[]) => {
-    pushHistory();
-    setLayersRaw(newLayers);
-  }, [pushHistory]);
+  setLayersSilent: (layers: Layer[]) => {
+    set({ layers });
+  },
 
-  const setActiveLayerId = useCallback((id: string | null) => {
-    setActiveLayerIdRaw(id);
-  }, []);
+  setActiveLayerId: (id: string | null) => {
+    set({ activeLayerId: id });
+  },
 
-  const addLayer = useCallback((layer: Layer) => {
-    pushHistory();
-    setLayersRaw((prev) => [layer, ...prev]);
-    setActiveLayerIdRaw(layer.id);
-  }, [pushHistory]);
+  addLayer: (layer: Layer) => {
+    get().pushHistory();
+    set((s) => ({ layers: [layer, ...s.layers], activeLayerId: layer.id }));
+  },
 
-  const removeLayer = useCallback(
-    (id: string) => {
-      pushHistory();
-      setLayersRaw((prev) => prev.filter((l) => l.id !== id));
-      setActiveLayerIdRaw((prev) => (prev === id ? null : prev));
-    },
-    [pushHistory]
-  );
+  removeLayer: (id: string) => {
+    get().pushHistory();
+    set((s) => ({
+      layers: s.layers.filter((l) => l.id !== id),
+      activeLayerId: s.activeLayerId === id ? null : s.activeLayerId,
+    }));
+  },
 
-  const updateLayer = useCallback((id: string, updates: Partial<Layer>) => {
-    pushHistory();
-    setLayersRaw((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, ...updates } : l))
-    );
-  }, [pushHistory]);
+  updateLayer: (id: string, updates: Partial<Layer>) => {
+    get().pushHistory();
+    set((s) => ({
+      layers: s.layers.map((l) => (l.id === id ? { ...l, ...updates } : l)),
+    }));
+  },
 
-  const reorderLayers = useCallback((fromIndex: number, toIndex: number) => {
-    pushHistory();
-    setLayersRaw((prev) => {
-      const next = [...prev];
+  updateLayerSilent: (id: string, updates: Partial<Layer>) => {
+    set((s) => ({
+      layers: s.layers.map((l) => (l.id === id ? { ...l, ...updates } : l)),
+    }));
+  },
+
+  updateLayerImage: (layerId: string, dataUrl: string) => {
+    const ref = generateImageRef();
+    imageCache.putSync(dataUrl, ref);
+    get().pushHistory();
+    set((s) => ({
+      layers: s.layers.map((l) =>
+        l.id === layerId
+          ? { ...l, imageRef: ref, imageData: undefined, type: "image" as const }
+          : l
+      ),
+    }));
+  },
+
+  updateLayerMask: (layerId: string, dataUrl: string) => {
+    const ref = generateImageRef();
+    imageCache.putSync(dataUrl, ref);
+    get().pushHistory();
+    set((s) => ({
+      layers: s.layers.map((l) =>
+        l.id === layerId
+          ? { ...l, maskRef: ref, maskData: undefined }
+          : l
+      ),
+    }));
+  },
+
+  reorderLayers: (fromIndex: number, toIndex: number) => {
+    get().pushHistory();
+    set((s) => {
+      const next = [...s.layers];
       const [moved] = next.splice(fromIndex, 1);
       next.splice(toIndex, 0, moved);
-      return next;
+      return { layers: next };
     });
-  }, [pushHistory]);
+  },
 
-  const setCanvasSize = useCallback((width: number, height: number) => {
-    setCanvasWidth(width);
-    setCanvasHeight(height);
-    pushHistory();
-    setLayersRaw((prev) =>
-      prev.map((l) =>
+  setActiveTool: (tool: Tool) => set({ activeTool: tool }),
+  setSelection: (sel: Selection | null) => set({ selection: sel }),
+  setCanvasOffset: (offset: { x: number; y: number }) => set({ canvasOffset: offset }),
+  setCanvasZoom: (zoom: number) => set({ canvasZoom: zoom }),
+  setBrushSize: (size: number) => set({ brushSize: size }),
+  setBrushColor: (color: string) => set({ brushColor: color }),
+  setBrushHardness: (hardness: number) => set({ brushHardness: hardness }),
+  setEditingMaskLayerId: (id: string | null) => set({ editingMaskLayerId: id }),
+  setGeminiApiKey: (key: string) => set({ geminiApiKey: key }),
+  setComfyuiUrl: (url: string) => set({ comfyuiUrl: url }),
+  setGenerationPrompt: (prompt: string) => set({ generationPrompt: prompt }),
+  setIsGenerating: (val: boolean) => set({ isGenerating: val }),
+  setMagicWandTolerance: (val: number) => set({ magicWandTolerance: val }),
+  setMagicWandContiguous: (val: boolean) => set({ magicWandContiguous: val }),
+  setGradientEndColor: (color: string) => set({ gradientEndColor: color }),
+  setGradientMode: (mode: GradientMode) => set({ gradientMode: mode }),
+  setCropAspectRatio: (ratio: CropAspectRatio) => set({ cropAspectRatio: ratio }),
+
+  setCanvasSize: (width: number, height: number) => {
+    get().pushHistory();
+    set((s) => ({
+      canvasWidth: width,
+      canvasHeight: height,
+      layers: s.layers.map((l) =>
         l.id === "bg-1" ? { ...l, width, height } : l
-      )
-    );
-  }, [pushHistory]);
+      ),
+    }));
+  },
 
-  // Lightweight canvas dimension setter — no history push, no layer updates
-  const setCanvasDimensions = useCallback((width: number, height: number) => {
-    setCanvasWidth(width);
-    setCanvasHeight(height);
-  }, []);
+  setCanvasDimensions: (width: number, height: number) => {
+    set({ canvasWidth: width, canvasHeight: height });
+  },
 
-  const addMaskToLayer = useCallback((layerId: string) => {
-    pushHistory();
-    setLayersRaw((prev) => {
-      return prev.map((l) => {
+  addMaskToLayer: (layerId: string) => {
+    get().pushHistory();
+    set((s) => ({
+      layers: s.layers.map((l) => {
         if (l.id !== layerId) return l;
         const canvas = document.createElement("canvas");
         canvas.width = l.width;
@@ -501,98 +565,37 @@ export function EditorProvider({ children }: { children: ReactNode }) {
           maskData: canvas.toDataURL("image/png"),
           maskEnabled: true,
         };
-      });
-    });
-    setEditingMaskLayerId(layerId);
-  }, [pushHistory]);
+      }),
+      editingMaskLayerId: layerId,
+    }));
+  },
 
-  const removeMaskFromLayer = useCallback((layerId: string) => {
-    pushHistory();
-    setLayersRaw((prev) =>
-      prev.map((l) =>
+  removeMaskFromLayer: (layerId: string) => {
+    get().pushHistory();
+    set((s) => ({
+      layers: s.layers.map((l) =>
         l.id === layerId
           ? { ...l, maskData: undefined, maskEnabled: undefined }
           : l
-      )
-    );
-    setEditingMaskLayerId((prev) => (prev === layerId ? null : prev));
-  }, [pushHistory]);
+      ),
+      editingMaskLayerId: s.editingMaskLayerId === layerId ? null : s.editingMaskLayerId,
+    }));
+  },
+}));
 
-  return (
-    <EditorContext.Provider
-      value={{
-        layers,
-        activeLayerId,
-        activeTool,
-        selection,
-        canvasOffset,
-        canvasZoom,
-        canvasWidth,
-        canvasHeight,
-        brushSize,
-        brushColor,
-        brushHardness,
-        editingMaskLayerId,
-        geminiApiKey,
-        comfyuiUrl,
-        generationPrompt,
-        isGenerating,
-        canUndo,
-        canRedo,
-        magicWandTolerance,
-        magicWandContiguous,
-        gradientEndColor,
-        gradientMode,
-        cropAspectRatio,
-        historyIndex: historyIndexRef.current,
-        historyLength: historyRef.current.length,
-        setLayers,
-        addLayer,
-        removeLayer,
-        updateLayer,
-        reorderLayers,
-        setActiveLayerId,
-        setActiveTool,
-        setSelection,
-        setCanvasOffset,
-        setCanvasZoom,
-        setCanvasSize,
-        setCanvasDimensions,
-        setBrushSize,
-        setBrushColor,
-        setBrushHardness,
-        setEditingMaskLayerId,
-        addMaskToLayer,
-        removeMaskFromLayer,
-        setGeminiApiKey,
-        setComfyuiUrl,
-        setGenerationPrompt,
-        setIsGenerating,
-        undo,
-        redo,
-        pushHistory,
-        setMagicWandTolerance,
-        setMagicWandContiguous,
-        setGradientEndColor,
-        setGradientMode,
-        setCropAspectRatio,
-        jumpToHistory,
-        updateLayerSilent: (id: string, updates: Partial<Layer>) => {
-          setLayersRaw((prev) =>
-            prev.map((l) => (l.id === id ? { ...l, ...updates } : l))
-          );
-        },
-        setLayersSilent: (layers: Layer[]) => {
-          setLayersRaw(layers);
-        },
-      }}
-    >
-      {children}
-    </EditorContext.Provider>
-  );
+export type EditorStore = EditorState & EditorActions;
+
+/**
+ * Selector-based hook for Zustand subscriptions.
+ * Use this in performance-sensitive components to avoid full-store re-renders.
+ */
+export function useEditorSelector<T>(selector: (state: EditorStore) => T): T {
+  return useEditorStore(selector);
 }
 
-export function useEditor() {
-  const ctx = useContext(EditorContext);
-  return ctx;
-}
+/**
+ * Convenience hook — returns the full store (state + actions).
+ * Drop-in replacement for the old Context-based useEditor().
+ */
+export const useEditor = useEditorStore;
+

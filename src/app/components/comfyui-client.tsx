@@ -85,10 +85,19 @@ export class ComfyUIClient {
       }
       throw new Error(
         `Failed to reach ${this.baseUrl}. ` +
-        `Ensure ComfyUI is running with --enable-cors-header and --listen 0.0.0.0.`
+        `Ensure ComfyUI is running. If using browser/Vite, use the Bridge Agent URL ` +
+        `(for example http://127.0.0.1:8765) or launch ComfyUI with proper CORS/origin settings.`
       );
     }
-    if (!res.ok) throw new Error(`ComfyUI responded with ${res.status} ${res.statusText}`);
+    if (!res.ok) {
+      if (res.status === 403) {
+        throw new Error(
+          `ComfyUI rejected the request (403). This is usually host/origin protection. ` +
+          `Use the Bridge Agent URL (recommended in browser) or adjust ComfyUI CORS/origin startup flags.`
+        );
+      }
+      throw new Error(`ComfyUI responded with ${res.status} ${res.statusText}`);
+    }
     return res.json();
   }
 
@@ -113,7 +122,11 @@ export class ComfyUIClient {
 
       this.ws.onerror = (err) => {
         console.error("[ComfyUI WS] Error:", err);
-        reject(new Error("WebSocket connection failed"));
+        reject(
+          new Error(
+            "WebSocket connection failed (often 403 origin check). In browser/Vite, use the Bridge Agent URL."
+          )
+        );
       };
 
       this.ws.onclose = () => {
@@ -294,6 +307,36 @@ export class ComfyUIClient {
     await fetch(`${this.baseUrl}/interrupt`, { method: "POST" });
   }
 
+  /**
+   * Fallback completion strategy when WebSocket progress is unavailable.
+   * Polls history until completion or timeout.
+   */
+  private async waitForCompletionByPolling(
+    promptId: string,
+    timeoutMs: number = 300000,
+    intervalMs: number = 1500,
+  ): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const history = await this.getHistory(promptId);
+        if (history?.status?.status_str === "error") {
+          throw new Error("ComfyUI execution failed (history status=error)");
+        }
+        if (history?.status?.completed) {
+          return;
+        }
+        if (history && Object.keys(history.outputs || {}).length > 0) {
+          return;
+        }
+      } catch {
+        // History may not be ready yet; continue polling.
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    throw new Error("Workflow execution timed out (polling fallback, 5 min)");
+  }
+
   // ─── High-Level: Run Workflow and Get Results ──────────────────
 
   /**
@@ -304,8 +347,18 @@ export class ComfyUIClient {
     workflow: Record<string, unknown>,
     onProgress?: ProgressCallback
   ): Promise<string[]> {
-    // Ensure WebSocket is connected for progress tracking
-    await this.connectWebSocket();
+    // Try WebSocket progress channel first; if unavailable, fall back to polling.
+    let websocketReady = false;
+    try {
+      await this.connectWebSocket();
+      websocketReady = true;
+    } catch (wsErr) {
+      console.warn("[ComfyUI] WS unavailable, using polling fallback:", wsErr);
+      onProgress?.({
+        type: "status",
+        data: { status: "polling_fallback", message: "WebSocket unavailable, polling history." },
+      });
+    }
 
     // Register progress callback
     const cbId = `run-${Date.now()}`;
@@ -324,18 +377,22 @@ export class ComfyUIClient {
         );
       }
 
-      // Wait for completion via WebSocket
-      await new Promise<string>((resolve, reject) => {
-        this.completionResolvers.set(promptId, resolve);
+      if (websocketReady) {
+        // Wait for completion via WebSocket
+        await new Promise<string>((resolve, reject) => {
+          this.completionResolvers.set(promptId, resolve);
 
-        // Timeout after 5 minutes
-        setTimeout(() => {
-          if (this.completionResolvers.has(promptId)) {
-            this.completionResolvers.delete(promptId);
-            reject(new Error("Workflow execution timed out (5 min)"));
-          }
-        }, 300000);
-      });
+          // Timeout after 5 minutes
+          setTimeout(() => {
+            if (this.completionResolvers.has(promptId)) {
+              this.completionResolvers.delete(promptId);
+              reject(new Error("Workflow execution timed out (5 min)"));
+            }
+          }, 300000);
+        });
+      } else {
+        await this.waitForCompletionByPolling(promptId);
+      }
 
       // Fetch history to get output images
       const history = await this.getHistory(promptId);

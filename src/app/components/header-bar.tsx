@@ -18,7 +18,8 @@ import {
 } from "lucide-react";
 import { useState, useRef, useEffect } from "react";
 import { useTheme } from "./theme-provider";
-import { useEditor, type Layer } from "./editor-store";
+import { useEditorSelector, type Layer, getLayerImageDataUrl, layerHasImage } from "./editor-store";
+import { imageCache as globalImageCache, generateImageRef } from "./image-cache";
 import { flattenLayers } from "./canvas-utils";
 import {
   serializeProject,
@@ -27,6 +28,7 @@ import {
   type ProjectFile,
 } from "./project-io";
 import { isElectron, saveFileNative, openFileNative } from "./electron-config";
+import { useShallow } from "zustand/react/shallow";
 
 const PRESETS = [
   { label: "512 x 512", w: 512, h: 512 },
@@ -68,7 +70,28 @@ export function HeaderBar() {
     setActiveLayerId,
     setCanvasDimensions,
     setLayersSilent,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      canvasZoom: s.canvasZoom,
+      setCanvasZoom: s.setCanvasZoom,
+      setCanvasOffset: s.setCanvasOffset,
+      addLayer: s.addLayer,
+      layers: s.layers,
+      selection: s.selection,
+      setSelection: s.setSelection,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      setCanvasSize: s.setCanvasSize,
+      undo: s.undo,
+      redo: s.redo,
+      canUndo: s.canUndo,
+      canRedo: s.canRedo,
+      activeLayerId: s.activeLayerId,
+      setActiveLayerId: s.setActiveLayerId,
+      setCanvasDimensions: s.setCanvasDimensions,
+      setLayersSilent: s.setLayersSilent,
+    }))
+  );
 
   const [showSizeModal, setShowSizeModal] = useState(false);
   const [sizeW, setSizeW] = useState(canvasWidth);
@@ -145,9 +168,11 @@ export function HeaderBar() {
     return `data:${mimeType};base64,${btoa(encoded)}`;
   };
 
-  const importImageFromData = (imageData: string, layerName: string) => {
+  const importImageFromData = (dataUrl: string, layerName: string) => {
+    const ref = generateImageRef();
     const img = new window.Image();
     img.onload = () => {
+      globalImageCache.putSync(dataUrl, ref);
       const imgAspect = img.width / img.height;
       let layerHeight = canvasHeight;
       let layerWidth = Math.round(layerHeight * imgAspect);
@@ -167,7 +192,7 @@ export function HeaderBar() {
         locked: false,
         opacity: 100,
         type: "image",
-        imageData,
+        imageRef: ref,
         blendMode: "normal",
         x,
         y,
@@ -176,7 +201,7 @@ export function HeaderBar() {
       };
       addLayer(newLayer);
     };
-    img.src = imageData;
+    img.src = dataUrl;
   };
 
   const applyProject = (project: ProjectFile) => {

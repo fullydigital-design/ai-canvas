@@ -11,9 +11,11 @@ import {
   Plus,
   Eye,
 } from "lucide-react";
-import { useEditor, type Layer } from "./editor-store";
+import { useEditorSelector, type Layer } from "./editor-store";
+import { imageCache as globalImageCache, generateImageRef } from "./image-cache";
 import { getComfyClient } from "./comfyui-client";
 import { extractLayerImage } from "./canvas-utils";
+import { useShallow } from "zustand/react/shallow";
 
 // SAM point prompt
 interface SAMPoint {
@@ -182,7 +184,17 @@ export function SAMIntegration({ open, onClose }: SAMIntegrationProps) {
     canvasHeight,
     addLayer,
     updateLayer,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      activeLayerId: s.activeLayerId,
+      comfyuiUrl: s.comfyuiUrl,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      addLayer: s.addLayer,
+      updateLayer: s.updateLayer,
+    }))
+  );
 
   const [mode, setMode] = useState<"auto" | "text">("text");
   const [textPrompt, setTextPrompt] = useState("");
@@ -270,9 +282,11 @@ export function SAMIntegration({ open, onClose }: SAMIntegrationProps) {
   const handleApplyAsMask = useCallback(() => {
     if (!resultMask || !activeLayerId) return;
 
-    // Apply the SAM result as a mask on the active layer
+    // Apply the SAM result as a mask on the active layer via cache
+    const maskRef = generateImageRef();
+    globalImageCache.putSync(resultMask, maskRef);
     updateLayer(activeLayerId, {
-      maskData: resultMask,
+      maskRef: maskRef,
       maskEnabled: true,
     });
     setProgressText("Mask applied to active layer!");
@@ -281,6 +295,8 @@ export function SAMIntegration({ open, onClose }: SAMIntegrationProps) {
   const handleApplyAsLayer = useCallback(() => {
     if (!resultMask) return;
 
+    const layerRef = generateImageRef();
+    globalImageCache.putSync(resultMask, layerRef);
     const newLayer: Layer = {
       id: `sam-mask-${Date.now()}`,
       name: `SAM: ${textPrompt || "auto"}`,
@@ -288,7 +304,7 @@ export function SAMIntegration({ open, onClose }: SAMIntegrationProps) {
       locked: false,
       opacity: 100,
       type: "ai-generated",
-      imageData: resultMask,
+      imageRef: layerRef,
       blendMode: "normal",
       x: activeLayer?.x ?? 0,
       y: activeLayer?.y ?? 0,

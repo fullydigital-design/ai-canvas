@@ -12,7 +12,8 @@ import {
   ChevronRight,
   CircleDot,
 } from "lucide-react";
-import { useEditor } from "./editor-store";
+import { useEditorSelector } from "./editor-store";
+import { useShallow } from "zustand/react/shallow";
 
 interface HistoryEntry {
   id: number;
@@ -33,7 +34,18 @@ export function HistoryPanel() {
     historyIndex,
     historyLength,
     jumpToHistory,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      canUndo: s.canUndo,
+      canRedo: s.canRedo,
+      undo: s.undo,
+      redo: s.redo,
+      historyIndex: s.historyIndex,
+      historyLength: s.historyLength,
+      jumpToHistory: s.jumpToHistory,
+    }))
+  );
 
   const [entries, setEntries] = useState<HistoryEntry[]>([
     {

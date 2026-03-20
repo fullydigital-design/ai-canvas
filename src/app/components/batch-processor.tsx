@@ -14,10 +14,13 @@ import {
   X,
   Pause,
 } from "lucide-react";
-import { useEditor, type Layer } from "./editor-store";
+import { useEditorSelector, type Layer } from "./editor-store";
 import { type ComfyWorkflowData } from "./comfyui-workflow-modal";
 import { getComfyClient, type ComfyProgressEvent } from "./comfyui-client";
 import { extractLayerImage } from "./canvas-utils";
+import { imageCache as globalImageCache, generateImageRef } from "./image-cache";
+import { getLayerImageDataUrl, layerHasImage } from "./editor-store";
+import { useShallow } from "zustand/react/shallow";
 
 interface BatchJob {
   layerId: string;
@@ -45,10 +48,13 @@ export function BatchProcessor({
     layers,
     addLayer,
     comfyuiUrl,
-    canvasWidth,
-    canvasHeight,
-    selection,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      addLayer: s.addLayer,
+      comfyuiUrl: s.comfyuiUrl,
+    }))
+  );
 
   const [selectedLayerIds, setSelectedLayerIds] = useState<Set<string>>(new Set());
   const [jobs, setJobs] = useState<BatchJob[]>([]);
@@ -167,6 +173,8 @@ export function BatchProcessor({
             img.src = resultImages[0];
           });
 
+          const batchRef = generateImageRef();
+          globalImageCache.putSync(resultImages[0], batchRef);
           const newLayer: Layer = {
             id: `batch-${Date.now()}-${i}`,
             name: `Batch: ${layer.name}`,
@@ -174,7 +182,7 @@ export function BatchProcessor({
             locked: false,
             opacity: 100,
             type: "ai-generated",
-            imageData: resultImages[0],
+            imageRef: batchRef,
             blendMode: "normal",
             x: layer.x,
             y: layer.y,
@@ -299,9 +307,9 @@ export function BatchProcessor({
                       </div>
                     </div>
                     {/* Thumbnail */}
-                    {layer.imageData && (
+                    {layerHasImage(layer) && (
                       <img
-                        src={layer.imageData}
+                        src={getLayerImageDataUrl(layer) || ""}
                         alt=""
                         className="w-8 h-8 rounded object-cover border border-border"
                       />

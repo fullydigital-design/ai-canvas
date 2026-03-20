@@ -18,7 +18,15 @@ import {
   Palette,
   Type,
 } from "lucide-react";
-import { useEditor, type Layer } from "./editor-store";
+import {
+  useEditorSelector,
+  type Layer,
+  type BlenderPassType,
+  getLayerMaskDataUrl,
+  layerHasMask,
+} from "./editor-store";
+import { imageCache as globalImageCache, generateImageRef } from "./image-cache";
+import { useShallow } from "zustand/react/shallow";
 
 // Preset color palette for fill layers
 const FILL_COLOR_PRESETS = [
@@ -26,6 +34,25 @@ const FILL_COLOR_PRESETS = [
   "#673ab7", "#3f51b5", "#2196f3", "#03a9f4", "#00bcd4",
   "#009688", "#4caf50", "#8bc34a", "#cddc39", "#ffeb3b",
   "#ffc107", "#ff9800", "#ff5722", "#795548", "#607d8b",
+];
+
+const BLENDER_PASS_LABELS: Record<BlenderPassType, string> = {
+  beauty: "Beauty",
+  albedo: "Albedo",
+  normal: "Normal",
+  depth: "Depth",
+  object_id: "Object ID",
+  material_id: "Material ID",
+  custom: "Custom",
+};
+
+const METADATA_ORDER = [
+  "scene",
+  "camera",
+  "frame",
+  "resolution",
+  "engine",
+  "seed",
 ];
 
 // Small mask thumbnail renderer
@@ -91,9 +118,30 @@ export function LayersPanel() {
     removeMaskFromLayer,
     activeTool,
     setActiveTool,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      activeLayerId: s.activeLayerId,
+      setActiveLayerId: s.setActiveLayerId,
+      addLayer: s.addLayer,
+      removeLayer: s.removeLayer,
+      updateLayer: s.updateLayer,
+      updateLayerSilent: s.updateLayerSilent,
+      pushHistory: s.pushHistory,
+      reorderLayers: s.reorderLayers,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      editingMaskLayerId: s.editingMaskLayerId,
+      setEditingMaskLayerId: s.setEditingMaskLayerId,
+      addMaskToLayer: s.addMaskToLayer,
+      removeMaskFromLayer: s.removeMaskFromLayer,
+      activeTool: s.activeTool,
+      setActiveTool: s.setActiveTool,
+    }))
+  );
 
   const [showColorPicker, setShowColorPicker] = useState(false);
+  const seenBlenderGroups = new Set<string>();
 
   // Close color picker when switching to a different layer
   useEffect(() => {
@@ -206,10 +254,20 @@ export function LayersPanel() {
           const LayerIcon = getLayerIcon(layer.type);
           const isActive = layer.id === activeLayerId;
           const isEditingMask = layer.id === editingMaskLayerId;
-          const hasMask = !!layer.maskData;
+          const hasMask = layerHasMask(layer);
+          const showGroupHeader = !!layer.blenderGroupId && !seenBlenderGroups.has(layer.blenderGroupId);
+          if (layer.blenderGroupId) {
+            seenBlenderGroups.add(layer.blenderGroupId);
+          }
+          const passLabel = layer.blenderPassType ? BLENDER_PASS_LABELS[layer.blenderPassType] : null;
 
           return (
             <div key={layer.id}>
+              {showGroupHeader && (
+                <div className="px-3 py-1 text-[10px] uppercase tracking-wider text-primary/80 border-b border-border/50 bg-primary/5 truncate">
+                  {layer.blenderGroupName || "Blender Pass Set"}
+                </div>
+              )}
               {/* Layer row */}
               <div
                 onClick={() => setActiveLayerId(layer.id)}
@@ -241,6 +299,11 @@ export function LayersPanel() {
                   <LayerIcon className="w-3.5 h-3.5 text-muted-foreground" />
                 )}
                 <span className="flex-1 text-xs truncate">{layer.name}</span>
+                {passLabel && (
+                  <span className="text-[9px] px-1 py-0.5 rounded border border-primary/30 text-primary/90 bg-primary/10 shrink-0">
+                    {passLabel}
+                  </span>
+                )}
                 <span className="text-xs text-muted-foreground">
                   {layer.opacity}%
                 </span>
@@ -292,7 +355,7 @@ export function LayersPanel() {
                   onClick={() => handleToggleMaskEdit(layer.id)}
                 >
                   <MaskThumbnail
-                    maskData={layer.maskData!}
+                    maskData={getLayerMaskDataUrl(layer) || ""}
                     width={layer.width}
                     height={layer.height}
                   />
@@ -523,9 +586,48 @@ export function LayersPanel() {
                 </div>
               )}
 
+              {(layer.blenderPassType || layer.sourceMetadata) && (
+                <div className="pt-1 border-t border-border/50 space-y-1">
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Source Metadata
+                  </div>
+                  {layer.blenderPassType && (
+                    <div className="text-[10px] text-muted-foreground flex justify-between gap-2">
+                      <span>Pass</span>
+                      <span className="text-foreground">{BLENDER_PASS_LABELS[layer.blenderPassType]}</span>
+                    </div>
+                  )}
+                  {layer.blenderGroupName && (
+                    <div className="text-[10px] text-muted-foreground flex justify-between gap-2">
+                      <span>Group</span>
+                      <span className="text-foreground truncate">{layer.blenderGroupName}</span>
+                    </div>
+                  )}
+                  {layer.blenderImportId && (
+                    <div className="text-[10px] text-muted-foreground flex justify-between gap-2">
+                      <span>Import</span>
+                      <span className="text-foreground font-mono truncate">{layer.blenderImportId}</span>
+                    </div>
+                  )}
+                  {layer.sourceMetadata && (
+                    <>
+                      {[
+                        ...METADATA_ORDER.filter((key) => key in layer.sourceMetadata!),
+                        ...Object.keys(layer.sourceMetadata).filter((key) => !METADATA_ORDER.includes(key)),
+                      ].map((key) => (
+                        <div key={key} className="text-[10px] text-muted-foreground flex justify-between gap-2">
+                          <span className="capitalize">{key.replace(/_/g, " ")}</span>
+                          <span className="text-foreground truncate">{String(layer.sourceMetadata?.[key])}</span>
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              )}
+
               {/* Mask controls */}
               <div className="pt-1 border-t border-border/50">
-                {layer.maskData ? (
+                {layerHasMask(layer) ? (
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => handleToggleMaskEdit(layer.id)}
@@ -549,8 +651,10 @@ export function LayersPanel() {
                         const ctx = canvas.getContext("2d")!;
                         ctx.fillStyle = "#ffffff";
                         ctx.fillRect(0, 0, layer.width, layer.height);
+                        const mRef = generateImageRef();
+                        globalImageCache.putSync(canvas.toDataURL("image/png"), mRef);
                         updateLayer(layer.id, {
-                          maskData: canvas.toDataURL("image/png"),
+                          maskRef: mRef,
                         });
                       }}
                       className="px-2 py-1.5 text-[10px] rounded-md border border-border bg-secondary text-muted-foreground hover:text-foreground"

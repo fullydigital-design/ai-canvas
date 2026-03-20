@@ -12,7 +12,8 @@ import {
   Plus,
   Type,
 } from "lucide-react";
-import { useEditor, type Layer } from "./editor-store";
+import { useEditorSelector, type Layer } from "./editor-store";
+import { useShallow } from "zustand/react/shallow";
 
 const FONT_OPTIONS = [
   "Inter",
@@ -43,7 +44,18 @@ export function TextToolPanel() {
     canvasHeight,
     selection,
     brushColor,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      activeLayerId: s.activeLayerId,
+      updateLayer: s.updateLayer,
+      addLayer: s.addLayer,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      selection: s.selection,
+      brushColor: s.brushColor,
+    }))
+  );
 
   const [newText, setNewText] = useState("Type here...");
 

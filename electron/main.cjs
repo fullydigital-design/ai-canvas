@@ -1,15 +1,61 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { runBlenderEmbedSpike } = require('./blender-embed-spike.cjs');
+const {
+  initBlenderProcessManager,
+  getBlenderProcessState,
+  setBlenderExecutablePath,
+  validateBlenderExecutablePath,
+  startBlenderProcess,
+  stopBlenderProcess,
+  restartBlenderProcess,
+  shutdownBlenderProcessManager,
+  hasRunningProcess,
+  setBlenderProcessStatus,
+  onBlenderProcessExit,
+} = require('./blender-process-manager.cjs');
+const {
+  setEmbedMainWindow,
+  getBlenderEmbedState,
+  attachBlenderEmbed,
+  syncBlenderEmbedBounds,
+  focusBlenderEmbed,
+  detachBlenderEmbed,
+  resetEmbedStateForProcessExit,
+} = require('./blender-embed-manager.cjs');
+const {
+  startBlenderBridgeServer,
+  stopBlenderBridgeServer,
+  getBlenderBridgeState,
+  setPendingCameraSnapshot,
+  getCameraBridgeState,
+  getSequenceSummaries,
+  getSequenceFrameData,
+} = require('./blender-bridge-server.cjs');
 
 // Keep a global reference of the window object
 let mainWindow = null;
+let isQuittingAfterBlenderCleanup = false;
 
 const isDev = !app.isPackaged;
 
 function sendMenuAction(action) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('menu-action', action);
+  }
+}
+
+async function installReactDevTools() {
+  if (!isDev) return;
+
+  try {
+    const { default: installExtension, REACT_DEVELOPER_TOOLS } = require('electron-devtools-installer');
+    await installExtension(REACT_DEVELOPER_TOOLS);
+    console.log('[devtools] React Developer Tools installed');
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    console.warn('[devtools] React Developer Tools install failed:', message);
   }
 }
 
@@ -45,8 +91,10 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    setEmbedMainWindow(null);
     mainWindow = null;
   });
+  setEmbedMainWindow(mainWindow);
 }
 
 function createAppMenu() {
@@ -108,6 +156,23 @@ function createAppMenu() {
       label: 'Help',
       submenu: [
         {
+          label: 'Run Blender Embed Spike (Notepad)',
+          click: async () => {
+            const result = await runBlenderEmbedSpike();
+            const detail = result.ok
+              ? `Status: success\nSteps: ${(result.steps || []).join(', ')}`
+              : `Status: failed\nReason: ${result.error || result.reason || 'Unknown error'}`;
+
+            dialog.showMessageBox(mainWindow, {
+              type: result.ok ? 'info' : 'warning',
+              title: 'Blender Embed Spike',
+              message: result.ok ? 'Attach/detach spike completed.' : 'Attach/detach spike failed.',
+              detail,
+            });
+          },
+        },
+        { type: 'separator' },
+        {
           label: 'Debug Window',
           accelerator: 'Ctrl+Shift+I',
           click: () => {
@@ -136,15 +201,63 @@ function createAppMenu() {
   Menu.setApplicationMenu(menu);
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  initBlenderProcessManager(app);
+  onBlenderProcessExit((pid) => {
+    resetEmbedStateForProcessExit(pid);
+  });
+  await installReactDevTools();
   createWindow();
   createAppMenu();
+  const bridgeStart = await startBlenderBridgeServer({
+    host: '127.0.0.1',
+    port: 8765,
+    onImport: (importMessage) => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        throw new Error('Main window is not available to receive imports.');
+      }
+      mainWindow.webContents.send('blender-bridge-import', importMessage);
+      return true;
+    },
+    onCameraStates: (cameraPayload) => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        throw new Error('Main window is not available to receive camera states.');
+      }
+      mainWindow.webContents.send('blender-bridge-camera-states', cameraPayload);
+      return true;
+    },
+    onSequence: (sequencePayload) => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        throw new Error('Main window is not available to receive sequence imports.');
+      }
+      mainWindow.webContents.send('blender-bridge-sequence', sequencePayload);
+      return true;
+    },
+  });
+  if (!bridgeStart.ok) {
+    console.warn('[blender-bridge] Failed to start:', bridgeStart.error || 'unknown error');
+  }
 });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
+});
+
+app.on('before-quit', (event) => {
+  if (isQuittingAfterBlenderCleanup) return;
+  if (!hasRunningProcess()) return;
+
+  event.preventDefault();
+  isQuittingAfterBlenderCleanup = true;
+  Promise.allSettled([detachBlenderEmbed(), shutdownBlenderProcessManager(), stopBlenderBridgeServer()])
+    .catch((error) => {
+      console.warn('[blender-process] Shutdown cleanup failed:', error && error.message ? error.message : String(error));
+    })
+    .finally(() => {
+      app.quit();
+    });
 });
 
 app.on('activate', () => {
@@ -220,5 +333,82 @@ ipcMain.handle('get-app-info', () => ({
 ipcMain.on('set-title', (event, title) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.setTitle(title);
+  }
+});
+
+ipcMain.handle('run-blender-embed-spike', async () => runBlenderEmbedSpike());
+
+ipcMain.handle('blender-process-get-state', async () => getBlenderProcessState());
+
+ipcMain.handle('blender-process-set-path', async (event, executablePath) => {
+  return setBlenderExecutablePath(executablePath);
+});
+
+ipcMain.handle('blender-process-validate-path', async (event, executablePath) => {
+  return validateBlenderExecutablePath(executablePath);
+});
+
+ipcMain.handle('blender-process-start', async (event, options) => {
+  return startBlenderProcess(options || {});
+});
+
+ipcMain.handle('blender-process-stop', async () => {
+  await detachBlenderEmbed();
+  return stopBlenderProcess();
+});
+
+ipcMain.handle('blender-process-restart', async () => {
+  await detachBlenderEmbed();
+  return restartBlenderProcess();
+});
+
+ipcMain.handle('blender-embed-get-state', async () => getBlenderEmbedState());
+
+ipcMain.handle('blender-embed-attach', async (event, bounds) => {
+  const processState = getBlenderProcessState();
+  if (!processState.isRunning || !processState.pid) {
+    return {
+      ok: false,
+      error: 'Blender process is not running. Start Blender first.',
+      state: getBlenderEmbedState(),
+    };
+  }
+  const attachResult = await attachBlenderEmbed(processState.pid, bounds || {});
+  if (attachResult.ok) {
+    setBlenderProcessStatus('embedded');
+  }
+  return attachResult;
+});
+
+ipcMain.handle('blender-embed-sync-bounds', async (event, bounds) => {
+  return syncBlenderEmbedBounds(bounds || {});
+});
+
+ipcMain.handle('blender-embed-focus', async () => {
+  return focusBlenderEmbed();
+});
+
+ipcMain.handle('blender-embed-detach', async () => {
+  const detached = await detachBlenderEmbed();
+  const processState = getBlenderProcessState();
+  if (processState.isRunning) {
+    setBlenderProcessStatus('detached');
+  }
+  return detached;
+});
+
+ipcMain.handle('blender-bridge-get-state', async () => getBlenderBridgeState());
+ipcMain.handle('blender-bridge-set-camera-snapshot', async (event, snapshot) => setPendingCameraSnapshot(snapshot || {}));
+ipcMain.handle('blender-bridge-get-camera-state', async () => getCameraBridgeState());
+ipcMain.handle('blender-bridge-get-sequences', async () => ({ ok: true, sequences: getSequenceSummaries() }));
+ipcMain.handle('blender-bridge-get-sequence-frame', async (event, args) => {
+  try {
+    const sequenceId = args && typeof args.sequenceId === 'string' ? args.sequenceId : '';
+    const frameIndex = args && Number.isFinite(args.frameIndex) ? args.frameIndex : 0;
+    const frame = await getSequenceFrameData(sequenceId, frameIndex);
+    return { ok: true, frame };
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    return { ok: false, error: message };
   }
 });

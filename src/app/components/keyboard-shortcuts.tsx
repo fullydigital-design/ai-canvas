@@ -3,12 +3,13 @@
  * Handles tool switching, undo/redo, brush size, selection, zoom, and more.
  */
 import { useEffect } from "react";
-import { useEditor, type Tool } from "./editor-store";
+import { useEditorSelector, type Tool } from "./editor-store";
 import {
   serializeProject,
   downloadProject,
   loadProjectFromFile,
 } from "./project-io";
+import { useShallow } from "zustand/react/shallow";
 
 export function useKeyboardShortcuts() {
   const {
@@ -34,7 +35,32 @@ export function useKeyboardShortcuts() {
     editingMaskLayerId,
     setEditingMaskLayerId,
     pushHistory,
-  } = useEditor();
+  } = useEditorSelector(
+    useShallow((s) => ({
+      activeTool: s.activeTool,
+      setActiveTool: s.setActiveTool,
+      undo: s.undo,
+      redo: s.redo,
+      canUndo: s.canUndo,
+      canRedo: s.canRedo,
+      brushSize: s.brushSize,
+      setBrushSize: s.setBrushSize,
+      selection: s.selection,
+      setSelection: s.setSelection,
+      activeLayerId: s.activeLayerId,
+      removeLayer: s.removeLayer,
+      layers: s.layers,
+      addLayer: s.addLayer,
+      canvasZoom: s.canvasZoom,
+      setCanvasZoom: s.setCanvasZoom,
+      setCanvasOffset: s.setCanvasOffset,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      editingMaskLayerId: s.editingMaskLayerId,
+      setEditingMaskLayerId: s.setEditingMaskLayerId,
+      pushHistory: s.pushHistory,
+    }))
+  );
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

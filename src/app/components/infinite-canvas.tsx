@@ -1,10 +1,13 @@
 import { useRef, useEffect, useCallback, useState } from "react";
-import { useEditor, type Selection } from "./editor-store";
-import { applyAllAdjustments, hasActiveAdjustments } from "./adjustment-utils";
-import { lassoPathToSelection, magicWandSelect, renderSelectionPath, DEFAULT_MAGIC_WAND } from "./selection-tools";
+import { useEditorSelector, getLayerImageDataUrl, getLayerMaskDataUrl, layerHasImage, layerHasMask } from "./editor-store";
+import { imageCache as globalImageCache } from "./image-cache";
+import { magicWandSelect, DEFAULT_MAGIC_WAND } from "./selection-tools";
 import { flattenLayers } from "./canvas-utils";
-
-const isDarkMode = () => document.documentElement.classList.contains("dark");
+import { renderCanvas, type RenderContext } from "./canvas-renderer";
+import { useShallow } from "zustand/react/shallow";
+import { useWheelZoom } from "./canvas-interactions/use-wheel-zoom";
+import { useCropInteractions } from "./canvas-interactions/use-crop-interactions";
+import { useSelectionInteractions } from "./canvas-interactions/use-selection-interactions";
 
 export function InfiniteCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -21,7 +24,6 @@ export function InfiniteCanvas() {
     canvasWidth,
     canvasHeight,
     activeLayerId,
-    updateLayer,
     brushSize,
     brushColor,
     brushHardness,
@@ -31,23 +33,49 @@ export function InfiniteCanvas() {
     pushHistory,
     setBrushColor,
     setLayers,
-    addLayer,
     gradientEndColor,
     gradientMode,
     cropAspectRatio,
     setCanvasDimensions,
     updateLayerSilent,
-  } = useEditor();
+    updateLayerImage,
+    updateLayerMask,
+  } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      activeTool: s.activeTool,
+      selection: s.selection,
+      setSelection: s.setSelection,
+      canvasOffset: s.canvasOffset,
+      setCanvasOffset: s.setCanvasOffset,
+      canvasZoom: s.canvasZoom,
+      setCanvasZoom: s.setCanvasZoom,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      activeLayerId: s.activeLayerId,
+      brushSize: s.brushSize,
+      brushColor: s.brushColor,
+      brushHardness: s.brushHardness,
+      editingMaskLayerId: s.editingMaskLayerId,
+      magicWandTolerance: s.magicWandTolerance,
+      magicWandContiguous: s.magicWandContiguous,
+      pushHistory: s.pushHistory,
+      setBrushColor: s.setBrushColor,
+      setLayers: s.setLayers,
+      gradientEndColor: s.gradientEndColor,
+      gradientMode: s.gradientMode,
+      cropAspectRatio: s.cropAspectRatio,
+      setCanvasDimensions: s.setCanvasDimensions,
+      updateLayerSilent: s.updateLayerSilent,
+      updateLayerImage: s.updateLayerImage,
+      updateLayerMask: s.updateLayerMask,
+    }))
+  );
 
   const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
-  const [selectionStart, setSelectionStart] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-  const [currentSelection, setCurrentSelection] = useState<Selection | null>(
-    null
-  );
+  // Keep drag origin in refs so rapid mousemove events don't compound stale state deltas.
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
+  const dragLayerOriginRef = useRef<{ x: number; y: number } | null>(null);
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
   const [imageCache, setImageCache] = useState<Map<string, HTMLImageElement>>(
@@ -75,26 +103,59 @@ export function InfiniteCanvas() {
   // Force re-render counter
   const [renderTick, setRenderTick] = useState(0);
 
-  // Lasso tool state
-  const lassoPointsRef = useRef<{ x: number; y: number }[]>([]);
-  const [lassoDrawing, setLassoDrawing] = useState(false);
-
   // Gradient tool state
   const [gradientStart, setGradientStart] = useState<{ x: number; y: number } | null>(null);
   const [gradientEnd, setGradientEnd] = useState<{ x: number; y: number } | null>(null);
 
-  // Crop tool state
-  const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
-  const [cropStart, setCropStart] = useState<{ x: number; y: number } | null>(null);
-  const [showCropConfirm, setShowCropConfirm] = useState(false);
+  const {
+    selectionStart,
+    currentSelection,
+    lassoDrawing,
+    lassoPointsRef,
+    startRectangleSelection,
+    updateRectangleSelection,
+    finalizeRectangleSelection,
+    startLasso,
+    appendLassoPoint,
+    finalizeLasso,
+  } = useSelectionInteractions();
+
+  const {
+    cropRect,
+    cropStart,
+    showCropConfirm,
+    beginCrop,
+    updateCropRect,
+    finalizeCropDrag,
+    applyCrop,
+    cancelCrop,
+  } = useCropInteractions({
+    cropAspectRatio,
+    setLayers,
+    setCanvasDimensions,
+  });
 
   // Clone stamp state
   const cloneSourceRef = useRef<{ x: number; y: number; layerId: string } | null>(null);
   // Clone stamp offscreen: holds the target layer's working canvas during a paint stroke
   const cloneOffscreenRef = useRef<HTMLCanvasElement | null>(null);
   const cloneOffscreenLayerIdRef = useRef<string | null>(null);
+  const cloneRasterScaleRef = useRef<{ x: number; y: number }>({ x: 1, y: 1 });
   // Snapshot of all layers flattened at the moment painting started (source pixels)
   const cloneSourceSnapshotRef = useRef<HTMLCanvasElement | null>(null);
+  const cloneSourceMappingRef = useRef<{
+    mode: "document" | "layer";
+    scaleX: number;
+    scaleY: number;
+    layerX: number;
+    layerY: number;
+  }>({
+    mode: "document",
+    scaleX: 1,
+    scaleY: 1,
+    layerX: 0,
+    layerY: 0,
+  });
   // Offset between source and first destination click
   const cloneOffsetRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
 
@@ -104,15 +165,55 @@ export function InfiniteCanvas() {
   // Brush / Eraser offscreen canvas (working surface for a stroke)
   const brushOffscreenRef = useRef<HTMLCanvasElement | null>(null);
   const brushOffscreenLayerIdRef = useRef<string | null>(null);
+  const brushRasterScaleRef = useRef<{ x: number; y: number }>({ x: 1, y: 1 });
 
-  // Load images for layers — also refresh when imageData changes
+  // Preserve source quality while editing image layers.
+  const getLayerRasterSpace = useCallback(
+    (layer: { id: string; width: number; height: number }) => {
+      const img = imageCache.get(layer.id);
+      if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+        const rw = img.naturalWidth;
+        const rh = img.naturalHeight;
+        return {
+          width: rw,
+          height: rh,
+          scaleX: rw / Math.max(1, layer.width),
+          scaleY: rh / Math.max(1, layer.height),
+        };
+      }
+      return { width: layer.width, height: layer.height, scaleX: 1, scaleY: 1 };
+    },
+    [imageCache],
+  );
+
+  // Load images for layers — supports both imageRef (global cache) and legacy imageData
   useEffect(() => {
     const newCache = new Map(imageCache);
     let changed = false;
     layers.forEach((layer) => {
-      if (layer.imageData) {
+      if (layer.imageRef) {
+        // imageRef layers use the global ImageCache; populate component cache from it
+        const globalEl = globalImageCache.getElement(layer.imageRef);
+        if (globalEl && globalEl.complete) {
+          const existing = newCache.get(layer.id);
+          if (existing !== globalEl) {
+            newCache.set(layer.id, globalEl);
+            changed = true;
+          }
+        } else {
+          // Image is still loading in global cache — subscribe for re-render
+          const dataUrl = globalImageCache.getDataUrl(layer.imageRef);
+          if (dataUrl) {
+            const img = new Image();
+            img.onload = () => {
+              setImageCache((prev) => new Map(prev).set(layer.id, img));
+            };
+            img.src = dataUrl;
+          }
+        }
+      } else if (layer.imageData) {
+        // Legacy: load directly from base64
         const cached = newCache.get(layer.id);
-        // Re-load if no cache entry or if the stored src doesn't match current imageData
         const cachedSrc = cached?.getAttribute("data-src");
         if (!cached || cachedSrc !== layer.imageData) {
           const img = new Image();
@@ -134,20 +235,30 @@ export function InfiniteCanvas() {
     if (changed) setImageCache(newCache);
   }, [layers]);
 
-  // Load mask images for ALL layers (including the one being edited as fallback)
+  // Load mask images for ALL layers — supports maskRef (global cache) and legacy maskData
   useEffect(() => {
     const cache = maskImageCacheRef.current;
     layers.forEach((layer) => {
-      if (layer.maskData) {
+      const maskDataUrl = getLayerMaskDataUrl(layer);
+      if (maskDataUrl) {
         const existing = cache.get(layer.id);
-        if (!existing || existing.getAttribute("data-src") !== layer.maskData) {
+        if (!existing || existing.getAttribute("data-src") !== maskDataUrl) {
+          // For maskRef layers, try global cache first
+          if (layer.maskRef) {
+            const globalEl = globalImageCache.getElement(layer.maskRef);
+            if (globalEl && globalEl.complete) {
+              cache.set(layer.id, globalEl);
+              setRenderTick((t) => t + 1);
+              return;
+            }
+          }
           const img = new Image();
-          img.setAttribute("data-src", layer.maskData);
+          img.setAttribute("data-src", maskDataUrl);
           img.onload = () => {
             cache.set(layer.id, img);
             setRenderTick((t) => t + 1);
           };
-          img.src = layer.maskData;
+          img.src = maskDataUrl;
         }
       }
     });
@@ -165,7 +276,7 @@ export function InfiniteCanvas() {
       // Leaving mask edit mode — commit offscreen to state if needed
       if (maskOffscreenRef.current && maskOffscreenLayerIdRef.current) {
         const dataUrl = maskOffscreenRef.current.toDataURL("image/png");
-        updateLayer(maskOffscreenLayerIdRef.current, { maskData: dataUrl });
+        updateLayerMask(maskOffscreenLayerIdRef.current, dataUrl);
       }
       maskOffscreenRef.current = null;
       maskOffscreenLayerIdRef.current = null;
@@ -173,7 +284,10 @@ export function InfiniteCanvas() {
     }
 
     const layer = layers.find((l) => l.id === editingMaskLayerId);
-    if (!layer || !layer.maskData) return;
+    if (!layer || !layerHasMask(layer)) return;
+
+    const maskDataUrl = getLayerMaskDataUrl(layer);
+    if (!maskDataUrl) return;
 
     const offscreen = document.createElement("canvas");
     offscreen.width = layer.width;
@@ -186,7 +300,7 @@ export function InfiniteCanvas() {
       maskOffscreenLayerIdRef.current = editingMaskLayerId;
       setRenderTick((t) => t + 1);
     };
-    img.src = layer.maskData;
+    img.src = maskDataUrl;
   }, [editingMaskLayerId]);
 
   const getCanvasCoords = useCallback(
@@ -272,8 +386,8 @@ export function InfiniteCanvas() {
     const layerId = maskOffscreenLayerIdRef.current;
     if (!offscreen || !layerId) return;
     const dataUrl = offscreen.toDataURL("image/png");
-    updateLayer(layerId, { maskData: dataUrl });
-  }, [updateLayer]);
+    updateLayerMask(layerId, dataUrl);
+  }, [updateLayerMask]);
 
   // === BRUSH / ERASER PAINT STROKE ===
   const paintBrushStroke = useCallback(
@@ -284,8 +398,12 @@ export function InfiniteCanvas() {
       if (!layer) return;
 
       const ctx = offscreen.getContext("2d")!;
-      const lx = x - layer.x;
-      const ly = y - layer.y;
+      const scaleX = brushRasterScaleRef.current.x;
+      const scaleY = brushRasterScaleRef.current.y;
+      const brushScale = (scaleX + scaleY) / 2;
+      const scaledBrushSize = brushSize * brushScale;
+      const lx = (x - layer.x) * scaleX;
+      const ly = (y - layer.y) * scaleY;
       const isEraser = activeTool === "eraser";
 
       ctx.save();
@@ -298,21 +416,21 @@ export function InfiniteCanvas() {
         ctx.fillStyle = brushColor;
         ctx.strokeStyle = brushColor;
       }
-      ctx.lineWidth = brushSize;
+      ctx.lineWidth = scaledBrushSize;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
 
       const softness = (100 - brushHardness) / 100;
       if (!isEraser && softness > 0.01) {
-        ctx.shadowBlur = brushSize * softness * 0.5;
+        ctx.shadowBlur = scaledBrushSize * softness * 0.5;
         ctx.shadowColor = brushColor;
       }
 
       if (prevX !== null && prevY !== null) {
-        const plx = prevX - layer.x;
-        const ply = prevY - layer.y;
+        const plx = (prevX - layer.x) * scaleX;
+        const ply = (prevY - layer.y) * scaleY;
         const dist = Math.hypot(lx - plx, ly - ply);
-        const step = Math.max(1, brushSize * 0.15);
+        const step = Math.max(1, scaledBrushSize * 0.15);
         if (dist > step) {
           ctx.beginPath();
           ctx.moveTo(plx, ply);
@@ -320,12 +438,12 @@ export function InfiniteCanvas() {
           ctx.stroke();
         } else {
           ctx.beginPath();
-          ctx.arc(lx, ly, brushSize / 2, 0, Math.PI * 2);
+          ctx.arc(lx, ly, scaledBrushSize / 2, 0, Math.PI * 2);
           ctx.fill();
         }
       } else {
         ctx.beginPath();
-        ctx.arc(lx, ly, brushSize / 2, 0, Math.PI * 2);
+        ctx.arc(lx, ly, scaledBrushSize / 2, 0, Math.PI * 2);
         ctx.fill();
       }
       ctx.restore();
@@ -340,10 +458,11 @@ export function InfiniteCanvas() {
     const layerId = brushOffscreenLayerIdRef.current;
     if (!offscreen || !layerId) return;
     const dataUrl = offscreen.toDataURL("image/png");
-    updateLayer(layerId, { imageData: dataUrl, type: "image" });
+    updateLayerImage(layerId, dataUrl);
     brushOffscreenRef.current = null;
     brushOffscreenLayerIdRef.current = null;
-  }, [updateLayer]);
+    brushRasterScaleRef.current = { x: 1, y: 1 };
+  }, [updateLayerImage]);
 
   // === CLONE STAMP DAB ===
   // Paints source pixels from the flattened snapshot onto the target layer offscreen
@@ -352,27 +471,43 @@ export function InfiniteCanvas() {
     const offscreen = cloneOffscreenRef.current;
     if (!snapshot || !offscreen) return;
 
-    const octx = offscreen.getContext("2d")!;
+    const octx = offscreen.getContext("2d", { willReadFrequently: true })!;
     const { dx, dy } = cloneOffsetRef.current;
+    const { x: scaleX, y: scaleY } = cloneRasterScaleRef.current;
+    const brushScale = (scaleX + scaleY) / 2;
+    const mappedBrushSize = Math.max(1, Math.round(brushSize * brushScale));
     const isHealing = activeTool === "healing-brush";
+    const sourceMap = cloneSourceMappingRef.current;
 
     // Source position in document coordinates
     const srcX = destX + dx;
     const srcY = destY + dy;
 
     // Local coordinates on the target layer's offscreen
-    const localX = destX - layer.x;
-    const localY = destY - layer.y;
+    const localX = (destX - layer.x) * scaleX;
+    const localY = (destY - layer.y) * scaleY;
 
-    const radius = brushSize / 2;
+    const radius = mappedBrushSize / 2;
     const softness = (100 - brushHardness) / 100;
 
     // Extract a circular patch from the flattened snapshot at the source position
-    const patchSize = brushSize;
+    const patchSize = mappedBrushSize;
     const patchCanvas = document.createElement("canvas");
     patchCanvas.width = patchSize;
     patchCanvas.height = patchSize;
-    const pctx = patchCanvas.getContext("2d")!;
+    const pctx = patchCanvas.getContext("2d", { willReadFrequently: true })!;
+    pctx.imageSmoothingEnabled = true;
+    pctx.imageSmoothingQuality = "high";
+
+    // Map source sampling coordinates to the snapshot space.
+    const mappedSrcX =
+      sourceMap.mode === "layer"
+        ? (srcX - sourceMap.layerX) * sourceMap.scaleX
+        : srcX * sourceMap.scaleX;
+    const mappedSrcY =
+      sourceMap.mode === "layer"
+        ? (srcY - sourceMap.layerY) * sourceMap.scaleY
+        : srcY * sourceMap.scaleY;
 
     // Draw circular clip from snapshot
     pctx.beginPath();
@@ -380,7 +515,7 @@ export function InfiniteCanvas() {
     pctx.clip();
     pctx.drawImage(
       snapshot,
-      srcX - radius, srcY - radius, patchSize, patchSize,
+      mappedSrcX - radius, mappedSrcY - radius, patchSize, patchSize,
       0, 0, patchSize, patchSize
     );
 
@@ -451,12 +586,19 @@ export function InfiniteCanvas() {
     const layerId = cloneOffscreenLayerIdRef.current;
     if (!offscreen || !layerId) return;
     const dataUrl = offscreen.toDataURL("image/png");
-    // Use raw setter to avoid double-pushing history (we already pushed before painting)
-    updateLayer(layerId, { imageData: dataUrl, type: "image" });
+    updateLayerImage(layerId, dataUrl);
     cloneOffscreenRef.current = null;
     cloneOffscreenLayerIdRef.current = null;
     cloneSourceSnapshotRef.current = null;
-  }, [updateLayer]);
+    cloneRasterScaleRef.current = { x: 1, y: 1 };
+    cloneSourceMappingRef.current = {
+      mode: "document",
+      scaleX: 1,
+      scaleY: 1,
+      layerX: 0,
+      layerY: 0,
+    };
+  }, [updateLayerImage]);
 
   // Get the mask source for rendering a layer
   const getMaskSource = useCallback(
@@ -471,30 +613,7 @@ export function InfiniteCanvas() {
     []
   );
 
-  // Convert a luminance mask (white=show, black=hide) into an alpha mask
-  // where the alpha channel represents visibility
-  const luminanceToAlpha = useCallback(
-    (src: HTMLCanvasElement | HTMLImageElement, w: number, h: number): HTMLCanvasElement => {
-      const temp = document.createElement("canvas");
-      temp.width = w;
-      temp.height = h;
-      const tctx = temp.getContext("2d")!;
-      tctx.drawImage(src, 0, 0, w, h);
-      const imgData = tctx.getImageData(0, 0, w, h);
-      const d = imgData.data;
-      for (let i = 0; i < d.length; i += 4) {
-        // Use the red channel (grayscale) as alpha; set RGB to white
-        const lum = d[i]; // red channel (mask is grayscale so r≈g≈b)
-        d[i + 3] = lum;   // alpha = luminance
-        d[i] = 255;
-        d[i + 1] = 255;
-        d[i + 2] = 255;
-      }
-      tctx.putImageData(imgData, 0, 0);
-      return temp;
-    },
-    []
-  );
+  // luminanceToAlpha is now in canvas-renderer.ts
 
   // === RENDER ===
   const render = useCallback(() => {
@@ -502,566 +621,58 @@ export function InfiniteCanvas() {
     const container = containerRef.current;
     if (!canvas || !container) return;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const cw = container.clientWidth;
-    const ch = container.clientHeight;
-    canvas.width = cw * dpr;
-    canvas.height = ch * dpr;
-    canvas.style.width = `${cw}px`;
-    canvas.style.height = `${ch}px`;
-    ctx.scale(dpr, dpr);
-
-    ctx.clearRect(0, 0, cw, ch);
-
-    const dark = isDarkMode();
-
-    // Draw infinite workspace grid dots (behind everything)
-    ctx.save();
-    const gridSize = 50 * canvasZoom;
-    if (gridSize > 8) {
-      const startX = canvasOffset.x % gridSize;
-      const startY = canvasOffset.y % gridSize;
-      ctx.fillStyle = dark
-        ? "rgba(255, 255, 255, 0.06)"
-        : "rgba(0, 0, 0, 0.08)";
-      for (let x = startX; x < cw; x += gridSize) {
-        for (let y = startY; y < ch; y += gridSize) {
-          ctx.beginPath();
-          ctx.arc(x, y, 1, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-    }
-    ctx.restore();
-
-    ctx.save();
-    ctx.translate(canvasOffset.x, canvasOffset.y);
-    ctx.scale(canvasZoom, canvasZoom);
-
-    const docW = canvasWidth;
-    const docH = canvasHeight;
-
-    // Checkerboard background for the document area
-    const tileSize = 16;
-    for (let y = 0; y < docH; y += tileSize) {
-      for (let x = 0; x < docW; x += tileSize) {
-        const isEven = (x / tileSize + y / tileSize) % 2 === 0;
-        ctx.fillStyle = dark
-          ? isEven
-            ? "#2a2a2a"
-            : "#222222"
-          : isEven
-          ? "#e8e8e8"
-          : "#d8d8d8";
-        ctx.fillRect(x, y, tileSize, tileSize);
-      }
-    }
-
-    // Draw layers bottom-to-top
-    const reversedLayers = [...layers].reverse();
-    for (const layer of reversedLayers) {
-      if (!layer.visible) continue;
-
-      ctx.save();
-      ctx.globalAlpha = layer.opacity / 100;
-      // Apply blend mode ("normal" maps to "source-over" in Canvas API)
-      ctx.globalCompositeOperation =
-        layer.blendMode === "normal" ? "source-over" : layer.blendMode as GlobalCompositeOperation;
-
-      // Check if this layer has an active mask
-      const hasMask = layer.maskData && layer.maskEnabled;
-      const maskSrc = hasMask ? getMaskSource(layer.id) : null;
-
-      if (hasMask && maskSrc) {
-        // Composite layer + mask on an offscreen canvas
-        const comp = document.createElement("canvas");
-        comp.width = layer.width;
-        comp.height = layer.height;
-        const cctx = comp.getContext("2d")!;
-
-        // 1) Draw the layer content
-        if (layer.type === "fill") {
-          cctx.fillStyle = layer.fillColor || "#ffffff";
-          cctx.fillRect(0, 0, layer.width, layer.height);
-        } else if (layer.type === "text" && layer.textContent) {
-          const fontSize = layer.textSize || 32;
-          const fontFamily = layer.textFont || "Inter";
-          const weight = layer.textBold ? "bold" : "normal";
-          const style = layer.textItalic ? "italic" : "normal";
-          const lineHeight = (layer.textLineHeight || 1.4) * fontSize;
-          cctx.fillStyle = layer.textColor || "#000000";
-          cctx.font = `${style} ${weight} ${fontSize}px ${fontFamily}, sans-serif`;
-          cctx.textBaseline = "top";
-          cctx.textAlign = layer.textAlign || "left";
-          const lines = layer.textContent.split("\n");
-          const textX =
-            layer.textAlign === "center"
-              ? layer.width / 2
-              : layer.textAlign === "right"
-              ? layer.width
-              : 0;
-          lines.forEach((line, lineIdx) => {
-            cctx.fillText(line, textX, lineIdx * lineHeight);
-          });
-        } else if (layer.imageData) {
-          const img = imageCache.get(layer.id);
-          if (img && img.complete) {
-            cctx.drawImage(img, 0, 0, layer.width, layer.height);
-          }
-        }
-
-        // 1b) Apply adjustments if any
-        if (hasActiveAdjustments(layer.adjustments)) {
-          const adjData = cctx.getImageData(0, 0, layer.width, layer.height);
-          applyAllAdjustments(adjData, layer.adjustments!);
-          cctx.putImageData(adjData, 0, 0);
-        }
-
-        // 2) Convert luminance mask to alpha mask, then apply with destination-in
-        const alphaMask = luminanceToAlpha(maskSrc, layer.width, layer.height);
-        cctx.globalCompositeOperation = "destination-in";
-        cctx.drawImage(alphaMask, 0, 0, layer.width, layer.height);
-
-        // 3) Draw composited result
-        ctx.drawImage(comp, layer.x, layer.y, layer.width, layer.height);
-      } else {
-        // No mask — draw layer directly
-
-        // ── Brush/Eraser live preview: override rendering while painting ──
-        if (brushOffscreenRef.current && brushOffscreenLayerIdRef.current === layer.id) {
-          ctx.drawImage(brushOffscreenRef.current, layer.x, layer.y, layer.width, layer.height);
-          ctx.restore();
-          continue;
-        }
-
-        if (layer.type === "fill") {
-          // For fill layers with adjustments, use offscreen canvas
-          if (hasActiveAdjustments(layer.adjustments)) {
-            const comp = document.createElement("canvas");
-            comp.width = layer.width;
-            comp.height = layer.height;
-            const cctx = comp.getContext("2d")!;
-            cctx.fillStyle = layer.fillColor || "#ffffff";
-            cctx.fillRect(0, 0, layer.width, layer.height);
-            const adjData = cctx.getImageData(0, 0, layer.width, layer.height);
-            applyAllAdjustments(adjData, layer.adjustments!);
-            cctx.putImageData(adjData, 0, 0);
-            ctx.drawImage(comp, layer.x, layer.y, layer.width, layer.height);
-          } else {
-            ctx.fillStyle = layer.fillColor || "#ffffff";
-            ctx.fillRect(layer.x, layer.y, layer.width, layer.height);
-          }
-        } else if (layer.type === "text" && layer.textContent) {
-          // Text layers always use an offscreen canvas for proper rendering
-          const tcomp = document.createElement("canvas");
-          tcomp.width = layer.width;
-          tcomp.height = layer.height;
-          const tctx = tcomp.getContext("2d")!;
-          const fontSize = layer.textSize || 32;
-          const fontFamily = layer.textFont || "Inter";
-          const weight = layer.textBold ? "bold" : "normal";
-          const style = layer.textItalic ? "italic" : "normal";
-          const lineHeight = (layer.textLineHeight || 1.4) * fontSize;
-          tctx.fillStyle = layer.textColor || "#000000";
-          tctx.font = `${style} ${weight} ${fontSize}px ${fontFamily}, sans-serif`;
-          tctx.textBaseline = "top";
-          tctx.textAlign = layer.textAlign || "left";
-          const lines = layer.textContent.split("\n");
-          const textX =
-            layer.textAlign === "center"
-              ? layer.width / 2
-              : layer.textAlign === "right"
-              ? layer.width
-              : 0;
-          lines.forEach((line, lineIdx) => {
-            tctx.fillText(line, textX, lineIdx * lineHeight);
-          });
-          if (hasActiveAdjustments(layer.adjustments)) {
-            const adjData = tctx.getImageData(0, 0, layer.width, layer.height);
-            applyAllAdjustments(adjData, layer.adjustments!);
-            tctx.putImageData(adjData, 0, 0);
-          }
-          ctx.drawImage(tcomp, layer.x, layer.y, layer.width, layer.height);
-        } else if (layer.imageData || (cloneOffscreenRef.current && cloneOffscreenLayerIdRef.current === layer.id)) {
-          // Use clone offscreen canvas if actively painting this layer
-          const cloneActive = cloneOffscreenRef.current && cloneOffscreenLayerIdRef.current === layer.id;
-          if (cloneActive) {
-            ctx.drawImage(cloneOffscreenRef.current!, layer.x, layer.y, layer.width, layer.height);
-          } else {
-            const img = imageCache.get(layer.id);
-            if (img && img.complete) {
-              if (hasActiveAdjustments(layer.adjustments)) {
-                const comp = document.createElement("canvas");
-                comp.width = layer.width;
-                comp.height = layer.height;
-                const cctx2 = comp.getContext("2d")!;
-                cctx2.drawImage(img, 0, 0, layer.width, layer.height);
-                const adjData = cctx2.getImageData(0, 0, layer.width, layer.height);
-                applyAllAdjustments(adjData, layer.adjustments!);
-                cctx2.putImageData(adjData, 0, 0);
-                ctx.drawImage(comp, layer.x, layer.y, layer.width, layer.height);
-              } else {
-                ctx.drawImage(img, layer.x, layer.y, layer.width, layer.height);
-              }
-            }
-          }
-        }
-      }
-
-      ctx.restore();
-    }
-
-    // === MASK EDITING OVERLAY ===
-    if (editingMaskLayerId) {
-      const maskLayer = layers.find((l) => l.id === editingMaskLayerId);
-      const maskSrc = maskLayer ? getMaskSource(maskLayer.id) : null;
-
-      if (maskLayer && maskSrc) {
-        // Create an overlay that shows hidden areas (where mask is black) in red
-        // Convert mask to alpha, then invert it for the overlay
-        const overlay = document.createElement("canvas");
-        overlay.width = maskLayer.width;
-        overlay.height = maskLayer.height;
-        const octx = overlay.getContext("2d")!;
-
-        // Draw red fill
-        octx.fillStyle = dark
-          ? "rgba(255, 60, 60, 1)"
-          : "rgba(255, 40, 40, 1)";
-        octx.fillRect(0, 0, maskLayer.width, maskLayer.height);
-
-        // Now we need to show red only where mask is BLACK (hidden)
-        // Convert mask luminance to alpha and use destination-out to cut away visible areas
-        const alphaMask = luminanceToAlpha(maskSrc, maskLayer.width, maskLayer.height);
-        octx.globalCompositeOperation = "destination-out";
-        octx.drawImage(alphaMask, 0, 0, maskLayer.width, maskLayer.height);
-
-        // Draw the overlay with transparency
-        ctx.save();
-        ctx.globalAlpha = 0.45;
-        ctx.drawImage(
-          overlay,
-          maskLayer.x,
-          maskLayer.y,
-          maskLayer.width,
-          maskLayer.height
-        );
-        ctx.restore();
-
-        // Marching-ants-style border around the mask layer
-        ctx.save();
-        ctx.strokeStyle = "#ff6b6b";
-        ctx.lineWidth = 2 / canvasZoom;
-        ctx.setLineDash([8 / canvasZoom, 4 / canvasZoom]);
-        ctx.lineDashOffset = -(Date.now() / 80) % 20;
-        ctx.strokeRect(
-          maskLayer.x,
-          maskLayer.y,
-          maskLayer.width,
-          maskLayer.height
-        );
-        ctx.setLineDash([]);
-        ctx.restore();
-      }
-    }
-
-    // === SELECTION ===
-    const sel = currentSelection || selection;
-    if (sel) {
-      // If the selection has a polygon path, render it
-      if (sel.path && sel.path.points.length > 2) {
-        renderSelectionPath(ctx, sel.path, canvasZoom);
-      }
-
-      ctx.strokeStyle = "#3ECF8E";
-      ctx.lineWidth = 2 / canvasZoom;
-      ctx.setLineDash([6 / canvasZoom, 4 / canvasZoom]);
-      ctx.strokeRect(sel.x, sel.y, sel.width, sel.height);
-      ctx.setLineDash([]);
-
-      ctx.fillStyle = "rgba(62, 207, 142, 0.08)";
-      ctx.fillRect(sel.x, sel.y, sel.width, sel.height);
-
-      const handleSize = 6 / canvasZoom;
-      ctx.fillStyle = "#3ECF8E";
-      [
-        { x: sel.x, y: sel.y },
-        { x: sel.x + sel.width, y: sel.y },
-        { x: sel.x, y: sel.y + sel.height },
-        { x: sel.x + sel.width, y: sel.y + sel.height },
-      ].forEach((c) => {
-        ctx.fillRect(
-          c.x - handleSize / 2,
-          c.y - handleSize / 2,
-          handleSize,
-          handleSize
-        );
-      });
-    }
-
-    // Document border
-    ctx.strokeStyle = dark
-      ? "rgba(62, 207, 142, 0.25)"
-      : "rgba(62, 207, 142, 0.35)";
-    ctx.lineWidth = 1 / canvasZoom;
-    ctx.setLineDash([]);
-    ctx.strokeRect(0, 0, docW, docH);
-
-    // === LASSO DRAWING PATH (live preview) ===
-    if (lassoDrawing && lassoPointsRef.current.length > 1) {
-      const pts = lassoPointsRef.current;
-      ctx.save();
-      ctx.strokeStyle = "#3ECF8E";
-      ctx.lineWidth = 1.5 / canvasZoom;
-      ctx.setLineDash([4 / canvasZoom, 3 / canvasZoom]);
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (let i = 1; i < pts.length; i++) {
-        ctx.lineTo(pts[i].x, pts[i].y);
-      }
-      ctx.stroke();
-      // Draw closing line to start (dashed)
-      ctx.strokeStyle = "rgba(62, 207, 142, 0.4)";
-      ctx.beginPath();
-      ctx.moveTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
-      ctx.lineTo(pts[0].x, pts[0].y);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.restore();
-    }
-
-    // === CLONE SOURCE INDICATOR ===
-    if (cloneSourceRef.current && (activeTool === "clone-stamp" || activeTool === "healing-brush")) {
-      const src = cloneSourceRef.current;
-      ctx.save();
-      ctx.strokeStyle = activeTool === "clone-stamp" ? "#3ECF8E" : "#60A5FA";
-      ctx.lineWidth = 1.5 / canvasZoom;
-      const crossSize = 8 / canvasZoom;
-      ctx.beginPath();
-      ctx.moveTo(src.x - crossSize, src.y);
-      ctx.lineTo(src.x + crossSize, src.y);
-      ctx.moveTo(src.x, src.y - crossSize);
-      ctx.lineTo(src.x, src.y + crossSize);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(src.x, src.y, crossSize * 1.5, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    // === GRADIENT PREVIEW LINE ===
-    if (activeTool === "gradient" && gradientStart && gradientEnd && isPainting) {
-      ctx.save();
-      if (gradientMode === "radial") {
-        // Radial preview: show an ellipse from center to edge
-        const radius = Math.hypot(gradientEnd.x - gradientStart.x, gradientEnd.y - gradientStart.y);
-        const grad = ctx.createRadialGradient(
-          gradientStart.x, gradientStart.y, 0,
-          gradientStart.x, gradientStart.y, radius
-        );
-        grad.addColorStop(0, brushColor + "44");
-        grad.addColorStop(1, gradientEndColor + "44");
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(gradientStart.x, gradientStart.y, radius, 0, Math.PI * 2);
-        ctx.fill();
-        // Dashed circle outline
-        ctx.strokeStyle = "rgba(62, 207, 142, 0.5)";
-        ctx.lineWidth = 1.5 / canvasZoom;
-        ctx.setLineDash([6 / canvasZoom, 4 / canvasZoom]);
-        ctx.beginPath();
-        ctx.arc(gradientStart.x, gradientStart.y, radius, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        // Radius line
-        ctx.strokeStyle = "rgba(62, 207, 142, 0.35)";
-        ctx.lineWidth = 1 / canvasZoom;
-        ctx.beginPath();
-        ctx.moveTo(gradientStart.x, gradientStart.y);
-        ctx.lineTo(gradientEnd.x, gradientEnd.y);
-        ctx.stroke();
-      } else {
-        // Linear preview (existing behavior)
-        const grad = ctx.createLinearGradient(
-          gradientStart.x, gradientStart.y,
-          gradientEnd.x, gradientEnd.y
-        );
-        grad.addColorStop(0, brushColor + "88");
-        grad.addColorStop(1, gradientEndColor + "88");
-        ctx.strokeStyle = grad;
-        ctx.lineWidth = 3 / canvasZoom;
-        ctx.setLineDash([6 / canvasZoom, 4 / canvasZoom]);
-        ctx.beginPath();
-        ctx.moveTo(gradientStart.x, gradientStart.y);
-        ctx.lineTo(gradientEnd.x, gradientEnd.y);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      // Start dot
-      ctx.fillStyle = brushColor;
-      ctx.beginPath();
-      ctx.arc(gradientStart.x, gradientStart.y, 4 / canvasZoom, 0, Math.PI * 2);
-      ctx.fill();
-      // End dot
-      ctx.fillStyle = gradientEndColor;
-      ctx.beginPath();
-      ctx.arc(gradientEnd.x, gradientEnd.y, 4 / canvasZoom, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
-
-    // === CROP TOOL OVERLAY ===
-    if (activeTool === "crop" && cropRect && cropRect.w > 0 && cropRect.h > 0) {
-      ctx.save();
-      // Darken areas outside crop
-      ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
-      // Top
-      ctx.fillRect(0, 0, docW, cropRect.y);
-      // Bottom
-      ctx.fillRect(0, cropRect.y + cropRect.h, docW, docH - cropRect.y - cropRect.h);
-      // Left
-      ctx.fillRect(0, cropRect.y, cropRect.x, cropRect.h);
-      // Right
-      ctx.fillRect(cropRect.x + cropRect.w, cropRect.y, docW - cropRect.x - cropRect.w, cropRect.h);
-
-      // Crop border
-      ctx.strokeStyle = "#3ECF8E";
-      ctx.lineWidth = 2 / canvasZoom;
-      ctx.setLineDash([]);
-      ctx.strokeRect(cropRect.x, cropRect.y, cropRect.w, cropRect.h);
-
-      // Rule of thirds lines
-      ctx.strokeStyle = "rgba(62, 207, 142, 0.25)";
-      ctx.lineWidth = 1 / canvasZoom;
-      for (let i = 1; i <= 2; i++) {
-        const rx = cropRect.x + (cropRect.w * i) / 3;
-        const ry = cropRect.y + (cropRect.h * i) / 3;
-        ctx.beginPath();
-        ctx.moveTo(rx, cropRect.y);
-        ctx.lineTo(rx, cropRect.y + cropRect.h);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(cropRect.x, ry);
-        ctx.lineTo(cropRect.x + cropRect.w, ry);
-        ctx.stroke();
-      }
-
-      // Size label
-      const cLabel = `${Math.round(cropRect.w)} x ${Math.round(cropRect.h)}`;
-      const cFontSize = 10 / canvasZoom;
-      ctx.fillStyle = "rgba(62, 207, 142, 0.9)";
-      ctx.font = `${cFontSize}px Inter, sans-serif`;
-      ctx.textAlign = "center";
-      ctx.fillText(cLabel, cropRect.x + cropRect.w / 2, cropRect.y - 6 / canvasZoom);
-
-      // Corner handles
-      const chs = 6 / canvasZoom;
-      ctx.fillStyle = "#3ECF8E";
-      [
-        { x: cropRect.x, y: cropRect.y },
-        { x: cropRect.x + cropRect.w, y: cropRect.y },
-        { x: cropRect.x, y: cropRect.y + cropRect.h },
-        { x: cropRect.x + cropRect.w, y: cropRect.y + cropRect.h },
-      ].forEach((c) => {
-        ctx.fillRect(c.x - chs / 2, c.y - chs / 2, chs, chs);
-      });
-
-      ctx.restore();
-    }
-
-    // === TRANSFORM TOOL HANDLES ===
-    if (activeTool === "transform" && activeLayerId) {
-      const tLayer = layers.find((l) => l.id === activeLayerId);
-      if (tLayer) {
-        const lx = tLayer.x;
-        const ly = tLayer.y;
-        const lw = tLayer.width;
-        const lh = tLayer.height;
-
-        // Bounding box
-        ctx.strokeStyle = "#3ECF8E";
-        ctx.lineWidth = 1.5 / canvasZoom;
-        ctx.setLineDash([]);
-        ctx.strokeRect(lx, ly, lw, lh);
-
-        // Diagonal guide lines
-        ctx.strokeStyle = "rgba(62, 207, 142, 0.15)";
-        ctx.lineWidth = 0.5 / canvasZoom;
-        ctx.beginPath();
-        ctx.moveTo(lx, ly);
-        ctx.lineTo(lx + lw, ly + lh);
-        ctx.moveTo(lx + lw, ly);
-        ctx.lineTo(lx, ly + lh);
-        ctx.stroke();
-
-        // Handle positions: 8 handles (corners + edge midpoints)
-        const hs = 7 / canvasZoom;
-        const handles = [
-          { x: lx, y: ly },                       // TL
-          { x: lx + lw / 2, y: ly },              // TC
-          { x: lx + lw, y: ly },                  // TR
-          { x: lx + lw, y: ly + lh / 2 },         // MR
-          { x: lx + lw, y: ly + lh },             // BR
-          { x: lx + lw / 2, y: ly + lh },         // BC
-          { x: lx, y: ly + lh },                  // BL
-          { x: lx, y: ly + lh / 2 },              // ML
-        ];
-
-        handles.forEach((h) => {
-          ctx.fillStyle = "#3ECF8E";
-          ctx.strokeStyle = dark ? "#1a1a2e" : "#ffffff";
-          ctx.lineWidth = 1.5 / canvasZoom;
-          ctx.fillRect(h.x - hs / 2, h.y - hs / 2, hs, hs);
-          ctx.strokeRect(h.x - hs / 2, h.y - hs / 2, hs, hs);
-        });
-
-        // Size label
-        const label = `${Math.round(lw)} x ${Math.round(lh)}`;
-        ctx.fillStyle = "rgba(62, 207, 142, 0.85)";
-        const fontSize = 10 / canvasZoom;
-        ctx.font = `${fontSize}px Inter, sans-serif`;
-        ctx.textAlign = "center";
-        ctx.fillText(label, lx + lw / 2, ly - 6 / canvasZoom);
-      }
-    }
-
-    ctx.restore();
+    const rc: RenderContext = {
+      canvas,
+      container,
+      layers,
+      imageCache,
+      canvasOffset,
+      canvasZoom,
+      canvasWidth,
+      canvasHeight,
+      selection,
+      currentSelection,
+      editingMaskLayerId,
+      getMaskSource,
+      activeTool,
+      activeLayerId,
+      lassoDrawing,
+      lassoPoints: lassoPointsRef.current,
+      cloneSource: cloneSourceRef.current,
+      gradientStart,
+      gradientEnd,
+      brushColor,
+      gradientEndColor,
+      gradientMode,
+      cropRect,
+      isPainting,
+      brushOffscreen: brushOffscreenRef.current,
+      brushOffscreenLayerId: brushOffscreenLayerIdRef.current,
+      cloneOffscreen: cloneOffscreenRef.current,
+      cloneOffscreenLayerId: cloneOffscreenLayerIdRef.current,
+    };
+    renderCanvas(rc);
   }, [
-    layers,
-    canvasOffset,
-    canvasZoom,
-    canvasWidth,
-    canvasHeight,
-    selection,
-    currentSelection,
-    imageCache,
-    editingMaskLayerId,
-    renderTick,
-    getMaskSource,
-    luminanceToAlpha,
-    activeTool,
-    activeLayerId,
-    lassoDrawing,
-    cloneSourceRef,
-    gradientStart,
-    gradientEnd,
-    brushColor,
-    gradientEndColor,
-    gradientMode,
-    cropRect,
-    isPainting,
+    layers, canvasOffset, canvasZoom, canvasWidth, canvasHeight,
+    selection, currentSelection, imageCache, editingMaskLayerId,
+    renderTick, getMaskSource, activeTool, activeLayerId,
+    lassoDrawing, gradientStart, gradientEnd, brushColor,
+    gradientEndColor, gradientMode, cropRect, isPainting,
   ]);
 
   // Render loop — use rAF for smooth animation (marching ants)
   useEffect(() => {
     let running = true;
+    const shouldAnimate =
+      !!editingMaskLayerId ||
+      isPainting ||
+      !!transformHandle ||
+      lassoDrawing ||
+      !!cropStart;
     const loop = () => {
       if (!running) return;
       render();
-      if (editingMaskLayerId || isPainting || transformHandle || lassoDrawing || cropStart || selection || currentSelection) {
+      if (shouldAnimate) {
         requestAnimationFrame(loop);
       }
     };
@@ -1070,7 +681,7 @@ export function InfiniteCanvas() {
       running = false;
       cancelAnimationFrame(frame);
     };
-  }, [render, editingMaskLayerId, isPainting, transformHandle, lassoDrawing, cropStart, selection, currentSelection]);
+  }, [render, editingMaskLayerId, isPainting, transformHandle, lassoDrawing, cropStart]);
 
   // Also re-render on any dependency change
   useEffect(() => {
@@ -1089,6 +700,10 @@ export function InfiniteCanvas() {
   // === MOUSE HANDLERS ===
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
+      // While crop confirmation is visible, ignore canvas tool interactions.
+      // This prevents button clicks from being consumed by crop tool mousedown logic.
+      if (showCropConfirm) return;
+
       const coords = getCanvasCoords(e.clientX, e.clientY);
 
       // Eyedropper — sample pixel color from flattened canvas
@@ -1096,9 +711,11 @@ export function InfiniteCanvas() {
         setIsPainting(true); // Enable continuous sampling during drag
         (async () => {
           try {
-            const flat = await flattenLayers(layers, canvasWidth, canvasHeight);
+            const flat = await flattenLayers(layers, canvasWidth, canvasHeight, {
+              preferMainThread: true,
+            });
             eyedropperSnapshotRef.current = flat;
-            const ctx2 = flat.getContext("2d")!;
+            const ctx2 = flat.getContext("2d", { willReadFrequently: true })!;
             const px = Math.round(coords.x);
             const py = Math.round(coords.y);
             if (px >= 0 && px < canvasWidth && py >= 0 && py < canvasHeight) {
@@ -1126,9 +743,7 @@ export function InfiniteCanvas() {
 
       // Crop tool — start crop rectangle drag
       if (activeTool === "crop") {
-        setCropStart(coords);
-        setCropRect(null);
-        setShowCropConfirm(false);
+        beginCrop(coords);
         return;
       }
 
@@ -1142,15 +757,13 @@ export function InfiniteCanvas() {
       }
 
       if (activeTool === "rectangle-select") {
-        setSelectionStart(coords);
-        setCurrentSelection(null);
+        startRectangleSelection(coords);
         return;
       }
 
       // Lasso tool — start drawing freehand path
       if (activeTool === "lasso") {
-        lassoPointsRef.current = [coords];
-        setLassoDrawing(true);
+        startLasso(coords);
         setIsPainting(true); // reuse for animation loop
         return;
       }
@@ -1159,7 +772,9 @@ export function InfiniteCanvas() {
       if (activeTool === "magic-wand") {
         (async () => {
           try {
-            const flat = await flattenLayers(layers, canvasWidth, canvasHeight);
+            const flat = await flattenLayers(layers, canvasWidth, canvasHeight, {
+              preferMainThread: true,
+            });
             const result = magicWandSelect(flat, coords.x, coords.y, {
               ...DEFAULT_MAGIC_WAND,
               tolerance: magicWandTolerance,
@@ -1180,33 +795,115 @@ export function InfiniteCanvas() {
           return;
         }
         if (cloneSourceRef.current && activeLayerId) {
+          const layer = layers.find((l) => l.id === activeLayerId);
+          if (!layer) return;
+          const raster = getLayerRasterSpace(layer);
+
           // Calculate offset from source to this first click point
           cloneOffsetRef.current = {
             dx: cloneSourceRef.current.x - coords.x,
             dy: cloneSourceRef.current.y - coords.y,
           };
-          // Take a flattened snapshot of the current canvas as the source
-          flattenLayers(layers, canvasWidth, canvasHeight).then((snap) => {
-            cloneSourceSnapshotRef.current = snap;
-            // Create an offscreen canvas for the target layer
-            const layer = layers.find((l) => l.id === activeLayerId);
-            if (!layer) return;
+
+          const initTargetOffscreen = () => {
             const offscreen = document.createElement("canvas");
-            offscreen.width = layer.width;
-            offscreen.height = layer.height;
-            const octx = offscreen.getContext("2d")!;
-            // If the layer already has image data, draw it first
-            if (layer.imageData) {
+            offscreen.width = raster.width;
+            offscreen.height = raster.height;
+            const octx = offscreen.getContext("2d", { willReadFrequently: true })!;
+            octx.imageSmoothingEnabled = true;
+            octx.imageSmoothingQuality = "high";
+            if (layerHasImage(layer)) {
               const img = imageCache.get(layer.id);
               if (img && img.complete) {
-                octx.drawImage(img, 0, 0, layer.width, layer.height);
+                octx.drawImage(img, 0, 0, raster.width, raster.height);
               }
             } else if (layer.type === "fill") {
               octx.fillStyle = layer.fillColor || "#ffffff";
-              octx.fillRect(0, 0, layer.width, layer.height);
+              octx.fillRect(0, 0, raster.width, raster.height);
+            } else if (layer.type === "text" && layer.textContent) {
+              const fontSize = layer.textSize || 32;
+              const fontFamily = layer.textFont || "Inter";
+              const weight = layer.textBold ? "bold" : "normal";
+              const style = layer.textItalic ? "italic" : "normal";
+              const lineHeight = (layer.textLineHeight || 1.4) * fontSize;
+              octx.fillStyle = layer.textColor || "#000000";
+              octx.font = `${style} ${weight} ${fontSize}px ${fontFamily}, sans-serif`;
+              octx.textBaseline = "top";
+              octx.textAlign = layer.textAlign || "left";
+              const textX =
+                layer.textAlign === "center" ? raster.width / 2
+                : layer.textAlign === "right" ? raster.width : 0;
+              layer.textContent.split("\n").forEach((line, lineIdx) => {
+                octx.fillText(line, textX, lineIdx * lineHeight);
+              });
             }
             cloneOffscreenRef.current = offscreen;
             cloneOffscreenLayerIdRef.current = layer.id;
+            cloneRasterScaleRef.current = { x: raster.scaleX, y: raster.scaleY };
+          };
+
+          // High-quality source when cloning from the same active layer:
+          // sample in original raster space instead of flattened display resolution.
+          if (cloneSourceRef.current.layerId === layer.id) {
+            const sourceCanvas = document.createElement("canvas");
+            sourceCanvas.width = raster.width;
+            sourceCanvas.height = raster.height;
+            const sctx = sourceCanvas.getContext("2d", { willReadFrequently: true })!;
+            sctx.imageSmoothingEnabled = true;
+            sctx.imageSmoothingQuality = "high";
+            if (layerHasImage(layer)) {
+              const img = imageCache.get(layer.id);
+              if (img && img.complete) {
+                sctx.drawImage(img, 0, 0, raster.width, raster.height);
+              }
+            } else if (layer.type === "fill") {
+              sctx.fillStyle = layer.fillColor || "#ffffff";
+              sctx.fillRect(0, 0, raster.width, raster.height);
+            } else if (layer.type === "text" && layer.textContent) {
+              const fontSize = layer.textSize || 32;
+              const fontFamily = layer.textFont || "Inter";
+              const weight = layer.textBold ? "bold" : "normal";
+              const style = layer.textItalic ? "italic" : "normal";
+              const lineHeight = (layer.textLineHeight || 1.4) * fontSize;
+              sctx.fillStyle = layer.textColor || "#000000";
+              sctx.font = `${style} ${weight} ${fontSize}px ${fontFamily}, sans-serif`;
+              sctx.textBaseline = "top";
+              sctx.textAlign = layer.textAlign || "left";
+              const textX =
+                layer.textAlign === "center" ? raster.width / 2
+                : layer.textAlign === "right" ? raster.width : 0;
+              layer.textContent.split("\n").forEach((line, lineIdx) => {
+                sctx.fillText(line, textX, lineIdx * lineHeight);
+              });
+            }
+            cloneSourceSnapshotRef.current = sourceCanvas;
+            cloneSourceMappingRef.current = {
+              mode: "layer",
+              scaleX: raster.scaleX,
+              scaleY: raster.scaleY,
+              layerX: layer.x,
+              layerY: layer.y,
+            };
+            initTargetOffscreen();
+            cloneStampDab(coords.x, coords.y, layer);
+            setIsPainting(true);
+            lastPaintPointRef.current = coords;
+            return;
+          }
+
+          // Fallback source: flattened document snapshot in canvas space.
+          flattenLayers(layers, canvasWidth, canvasHeight, {
+            preferMainThread: true,
+          }).then((snap) => {
+            cloneSourceSnapshotRef.current = snap;
+            cloneSourceMappingRef.current = {
+              mode: "document",
+              scaleX: 1,
+              scaleY: 1,
+              layerX: 0,
+              layerY: 0,
+            };
+            initTargetOffscreen();
             // Paint the first dab
             cloneStampDab(coords.x, coords.y, layer);
           });
@@ -1278,9 +975,12 @@ export function InfiniteCanvas() {
         (activeTool === "move" || e.ctrlKey || e.metaKey) &&
         activeLayerId
       ) {
+        const layer = layers.find((l) => l.id === activeLayerId);
+        if (!layer) return;
         pushHistory(); // Push history once at start of move drag
+        dragStartRef.current = coords;
+        dragLayerOriginRef.current = { x: layer.x, y: layer.y };
         setIsDragging(true);
-        setDragStart(coords);
         return;
       }
 
@@ -1288,19 +988,22 @@ export function InfiniteCanvas() {
       if (activeTool === "brush" || activeTool === "eraser") {
         const layer = layers.find((l) => l.id === activeLayerId);
         if (!layer) return;
+        const raster = getLayerRasterSpace(layer);
         const offscreen = document.createElement("canvas");
-        offscreen.width = layer.width;
-        offscreen.height = layer.height;
+        offscreen.width = raster.width;
+        offscreen.height = raster.height;
         const octx = offscreen.getContext("2d")!;
+        octx.imageSmoothingEnabled = true;
+        octx.imageSmoothingQuality = "high";
         // Rasterize existing layer content to the offscreen canvas first
-        if (layer.imageData) {
+        if (layerHasImage(layer)) {
           const img = imageCache.get(layer.id);
           if (img && img.complete) {
-            octx.drawImage(img, 0, 0, layer.width, layer.height);
+            octx.drawImage(img, 0, 0, raster.width, raster.height);
           }
         } else if (layer.type === "fill") {
           octx.fillStyle = layer.fillColor || "#ffffff";
-          octx.fillRect(0, 0, layer.width, layer.height);
+          octx.fillRect(0, 0, raster.width, raster.height);
         } else if (layer.type === "text" && layer.textContent) {
           // Rasterize text so the brush can paint over it
           const fontSize = layer.textSize || 32;
@@ -1313,14 +1016,15 @@ export function InfiniteCanvas() {
           octx.textBaseline = "top";
           octx.textAlign = layer.textAlign || "left";
           const textX =
-            layer.textAlign === "center" ? layer.width / 2
-            : layer.textAlign === "right" ? layer.width : 0;
+            layer.textAlign === "center" ? raster.width / 2
+            : layer.textAlign === "right" ? raster.width : 0;
           layer.textContent.split("\n").forEach((line, lineIdx) => {
             octx.fillText(line, textX, lineIdx * lineHeight);
           });
         }
         brushOffscreenRef.current = offscreen;
         brushOffscreenLayerIdRef.current = layer.id;
+        brushRasterScaleRef.current = { x: raster.scaleX, y: raster.scaleY };
         setIsPainting(true);
         lastPaintPointRef.current = coords;
         paintBrushStroke(coords.x, coords.y, null, null);
@@ -1340,12 +1044,16 @@ export function InfiniteCanvas() {
       magicWandContiguous,
       pushHistory,
       imageCache,
+      getLayerRasterSpace,
       cloneStampDab,
       canvasWidth,
       canvasHeight,
       brushColor,
       paintBrushStroke,
       setBrushColor,
+      beginCrop,
+      startRectangleSelection,
+      startLasso,
     ]
   );
 
@@ -1378,7 +1086,9 @@ export function InfiniteCanvas() {
         const px = Math.round(canvasCoords.x);
         const py = Math.round(canvasCoords.y);
         if (px >= 0 && px < canvasWidth && py >= 0 && py < canvasHeight) {
-          const ctx2 = eyedropperSnapshotRef.current.getContext("2d")!;
+          const ctx2 = eyedropperSnapshotRef.current.getContext("2d", {
+            willReadFrequently: true,
+          })!;
           const pixel = ctx2.getImageData(px, py, 1, 1).data;
           const hex = `#${pixel[0].toString(16).padStart(2, "0")}${pixel[1].toString(16).padStart(2, "0")}${pixel[2].toString(16).padStart(2, "0")}`;
           setBrushColor(hex);
@@ -1399,36 +1109,18 @@ export function InfiniteCanvas() {
 
       // Crop tool — update crop rectangle (with optional aspect ratio constraint)
       if (activeTool === "crop" && cropStart) {
-        let w = Math.abs(canvasCoords.x - cropStart.x);
-        let h = Math.abs(canvasCoords.y - cropStart.y);
-        if (cropAspectRatio !== null && cropAspectRatio > 0) {
-          // Constrain to aspect ratio: use the larger dimension as reference
-          if (w / cropAspectRatio > h) {
-            h = w / cropAspectRatio;
-          } else {
-            w = h * cropAspectRatio;
-          }
-        }
-        const x = canvasCoords.x >= cropStart.x ? cropStart.x : cropStart.x - w;
-        const y = canvasCoords.y >= cropStart.y ? cropStart.y : cropStart.y - h;
-        setCropRect({ x, y, w, h });
+        updateCropRect(canvasCoords);
         return;
       }
 
       if (selectionStart && activeTool === "rectangle-select") {
-        const coords = getCanvasCoords(e.clientX, e.clientY);
-        const x = Math.min(selectionStart.x, coords.x);
-        const y = Math.min(selectionStart.y, coords.y);
-        const width = Math.abs(coords.x - selectionStart.x);
-        const height = Math.abs(coords.y - selectionStart.y);
-        setCurrentSelection({ x, y, width, height });
+        updateRectangleSelection(canvasCoords);
         return;
       }
 
       // Lasso tool — draw freehand path
       if (lassoDrawing) {
-        const coords = getCanvasCoords(e.clientX, e.clientY);
-        lassoPointsRef.current.push(coords);
+        appendLassoPoint(canvasCoords);
         return;
       }
 
@@ -1550,16 +1242,16 @@ export function InfiniteCanvas() {
         (e.ctrlKey || e.metaKey || activeTool === "move")
       ) {
         const coords = getCanvasCoords(e.clientX, e.clientY);
-        const layer = layers.find((l) => l.id === activeLayerId);
-        if (layer) {
-          const dx = coords.x - dragStart.x;
-          const dy = coords.y - dragStart.y;
-          updateLayerSilent(activeLayerId, {
-            x: layer.x + dx,
-            y: layer.y + dy,
-          });
-          setDragStart(coords);
-        }
+        const dragStart = dragStartRef.current;
+        const dragOrigin = dragLayerOriginRef.current;
+        if (!dragStart || !dragOrigin) return;
+
+        const dx = coords.x - dragStart.x;
+        const dy = coords.y - dragStart.y;
+        updateLayerSilent(activeLayerId, {
+          x: dragOrigin.x + dx,
+          y: dragOrigin.y + dy,
+        });
       }
 
       // Brush / Eraser painting
@@ -1605,8 +1297,6 @@ export function InfiniteCanvas() {
       isDragging,
       activeLayerId,
       layers,
-      dragStart,
-      updateLayer,
       updateLayerSilent,
       isPainting,
       paintStroke,
@@ -1620,9 +1310,12 @@ export function InfiniteCanvas() {
       setBrushColor,
       canvasWidth,
       canvasHeight,
-      cropAspectRatio,
       cropStart,
       gradientStart,
+      showCropConfirm,
+      updateCropRect,
+      updateRectangleSelection,
+      appendLassoPoint,
     ]
   );
 
@@ -1644,27 +1337,30 @@ export function InfiniteCanvas() {
       setIsPainting(false);
       const layer = layers.find((l) => l.id === activeLayerId);
       if (layer) {
+        const raster = getLayerRasterSpace(layer);
         const canvas = document.createElement("canvas");
-        canvas.width = layer.width;
-        canvas.height = layer.height;
+        canvas.width = raster.width;
+        canvas.height = raster.height;
         const gctx = canvas.getContext("2d")!;
+        gctx.imageSmoothingEnabled = true;
+        gctx.imageSmoothingQuality = "high";
 
         // Draw existing layer content first
-        if (layer.imageData) {
+        if (layerHasImage(layer)) {
           const img = imageCache.get(layer.id);
           if (img && img.complete) {
-            gctx.drawImage(img, 0, 0, layer.width, layer.height);
+            gctx.drawImage(img, 0, 0, raster.width, raster.height);
           }
         } else if (layer.type === "fill") {
           gctx.fillStyle = layer.fillColor || "#ffffff";
-          gctx.fillRect(0, 0, layer.width, layer.height);
+          gctx.fillRect(0, 0, raster.width, raster.height);
         }
 
         // Create and apply gradient
-        const x0 = gradientStart.x - layer.x;
-        const y0 = gradientStart.y - layer.y;
-        const x1 = gradientEnd.x - layer.x;
-        const y1 = gradientEnd.y - layer.y;
+        const x0 = (gradientStart.x - layer.x) * raster.scaleX;
+        const y0 = (gradientStart.y - layer.y) * raster.scaleY;
+        const x1 = (gradientEnd.x - layer.x) * raster.scaleX;
+        const y1 = (gradientEnd.y - layer.y) * raster.scaleY;
         let grad: CanvasGradient;
         if (gradientMode === "radial") {
           const radius = Math.hypot(x1 - x0, y1 - y0);
@@ -1674,10 +1370,44 @@ export function InfiniteCanvas() {
         }
         grad.addColorStop(0, brushColor);
         grad.addColorStop(1, gradientEndColor);
-        gctx.fillStyle = grad;
-        gctx.fillRect(0, 0, layer.width, layer.height);
+        // Respect active selection: apply gradient only inside selection bounds/path.
+        const hasSelection =
+          !!selection && selection.width > 0 && selection.height > 0;
+        if (hasSelection) {
+          gctx.save();
+          gctx.beginPath();
+          if (selection.path && selection.path.points.length > 2) {
+            const [first, ...rest] = selection.path.points;
+            gctx.moveTo(
+              (first.x - layer.x) * raster.scaleX,
+              (first.y - layer.y) * raster.scaleY,
+            );
+            for (const point of rest) {
+              gctx.lineTo(
+                (point.x - layer.x) * raster.scaleX,
+                (point.y - layer.y) * raster.scaleY,
+              );
+            }
+            gctx.closePath();
+          } else {
+            gctx.rect(
+              (selection.x - layer.x) * raster.scaleX,
+              (selection.y - layer.y) * raster.scaleY,
+              selection.width * raster.scaleX,
+              selection.height * raster.scaleY,
+            );
+          }
+          gctx.clip();
+        }
 
-        updateLayer(layer.id, { imageData: canvas.toDataURL("image/png"), type: "image" });
+        gctx.fillStyle = grad;
+        gctx.fillRect(0, 0, raster.width, raster.height);
+
+        if (hasSelection) {
+          gctx.restore();
+        }
+
+        updateLayerImage(layer.id, canvas.toDataURL("image/png"));
       }
       setGradientStart(null);
       setGradientEnd(null);
@@ -1685,26 +1415,15 @@ export function InfiniteCanvas() {
     }
 
     // Crop tool — show confirm overlay
-    if (activeTool === "crop" && cropStart && cropRect && cropRect.w > 4 && cropRect.h > 4) {
-      setCropStart(null);
-      setShowCropConfirm(true);
-      return;
-    }
     if (activeTool === "crop") {
-      setCropStart(null);
+      finalizeCropDrag();
       return;
     }
 
     // Lasso tool — finalize selection (before isPainting check since lasso reuses isPainting)
     if (lassoDrawing) {
       setIsPainting(false);
-      setLassoDrawing(false);
-      const path = lassoPointsRef.current;
-      if (path.length > 2) {
-        const sel = lassoPathToSelection(path);
-        if (sel) setSelection(sel);
-      }
-      lassoPointsRef.current = [];
+      finalizeLasso(setSelection);
       return;
     }
 
@@ -1724,33 +1443,19 @@ export function InfiniteCanvas() {
       setTransformHandle(null);
       return;
     }
-    if (selectionStart && currentSelection) {
-      setSelection(currentSelection);
-      setCurrentSelection(null);
-    }
-    setSelectionStart(null);
+    finalizeRectangleSelection(setSelection);
+    dragStartRef.current = null;
+    dragLayerOriginRef.current = null;
     setIsDragging(false);
-  }, [isPanning, isPainting, selectionStart, currentSelection, setSelection, commitMask, transformHandle, lassoDrawing, activeTool, commitCloneStamp, commitBrushStroke, gradientStart, gradientEnd, brushColor, gradientEndColor, gradientMode, activeLayerId, layers, imageCache, cropRect, cropStart, updateLayer, pushHistory, setLayers, setCanvasDimensions]);
+  }, [isPanning, isPainting, setSelection, commitMask, transformHandle, lassoDrawing, activeTool, commitCloneStamp, commitBrushStroke, gradientStart, gradientEnd, brushColor, gradientEndColor, gradientMode, activeLayerId, layers, imageCache, selection, getLayerRasterSpace, finalizeCropDrag, finalizeLasso, finalizeRectangleSelection]);
 
-  const handleWheel = useCallback(
-    (e: React.WheelEvent) => {
-      e.preventDefault();
-      const delta = e.deltaY > 0 ? 0.9 : 1.1;
-      const newZoom = Math.max(0.1, Math.min(10, canvasZoom * delta));
-      const rect = containerRef.current?.getBoundingClientRect();
-      if (rect) {
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-        const newOffsetX =
-          mouseX - (mouseX - canvasOffset.x) * (newZoom / canvasZoom);
-        const newOffsetY =
-          mouseY - (mouseY - canvasOffset.y) * (newZoom / canvasZoom);
-        setCanvasOffset({ x: newOffsetX, y: newOffsetY });
-      }
-      setCanvasZoom(newZoom);
-    },
-    [canvasZoom, canvasOffset, setCanvasZoom, setCanvasOffset]
-  );
+  useWheelZoom({
+    containerRef,
+    canvasZoom,
+    canvasOffset,
+    setCanvasZoom,
+    setCanvasOffset,
+  });
 
   const getCursor = () => {
     if (
@@ -1818,7 +1523,6 @@ export function InfiniteCanvas() {
         setMouseInCanvas(false);
       }}
       onMouseEnter={() => setMouseInCanvas(true)}
-      onWheel={handleWheel}
     >
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
 
@@ -1891,32 +1595,17 @@ export function InfiniteCanvas() {
 
       {/* Crop confirm overlay */}
       {showCropConfirm && cropRect && cropRect.w > 4 && cropRect.h > 4 && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-card/95 backdrop-blur-sm border border-primary/30 rounded-md px-3 py-2 text-xs flex items-center gap-3 z-20 shadow-lg">
+        <div
+          className="absolute top-3 left-1/2 -translate-x-1/2 bg-card/95 backdrop-blur-sm border border-primary/30 rounded-md px-3 py-2 text-xs flex items-center gap-3 z-20 shadow-lg"
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
           <span className="text-foreground">
             Crop to {Math.round(cropRect.w)} x {Math.round(cropRect.h)}?
           </span>
           <button
             onClick={() => {
-              // Apply crop: resize canvas and reposition all layers
-              const cx = Math.round(cropRect.x);
-              const cy = Math.round(cropRect.y);
-              const cw = Math.round(cropRect.w);
-              const ch = Math.round(cropRect.h);
-              
-              // Update all layers: shift positions and clip content
-              // setLayers pushes history once; setCanvasDimensions is lightweight (no history)
-              const newLayers = layers.map((l) => ({
-                ...l,
-                x: l.x - cx,
-                y: l.y - cy,
-                // Resize background fill layer to match new canvas
-                ...(l.id === "bg-1" ? { width: cw, height: ch, x: 0, y: 0 } : {}),
-              }));
-              setLayers(newLayers);
-              setCanvasDimensions(cw, ch);
-              
-              setCropRect(null);
-              setShowCropConfirm(false);
+              applyCrop(layers);
             }}
             className="px-3 py-1 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
           >
@@ -1924,8 +1613,7 @@ export function InfiniteCanvas() {
           </button>
           <button
             onClick={() => {
-              setCropRect(null);
-              setShowCropConfirm(false);
+              cancelCrop();
             }}
             className="px-3 py-1 bg-secondary text-foreground rounded-md hover:bg-accent transition-colors border border-border"
           >

@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import {
   ChevronRight,
   ChevronDown,
@@ -16,13 +16,12 @@ import {
   Eye,
   EyeOff,
   Zap,
-  Wifi,
-  WifiOff,
-  RefreshCw,
   AlertCircle,
-  Server,
   FileCode,
 } from "lucide-react";
+import { ComfyEndpointSettings } from "./comfyui-endpoint-settings";
+import { ComfyQueueRunControls } from "./comfyui-queue-run-controls";
+import { useComfyUiConnection } from "./use-comfyui-connection";
 
 // ─── Types ───────────────────────────────────────────────────
 interface LaunchFlag {
@@ -42,7 +41,6 @@ interface FlagCategory {
 }
 
 type GpuPreset = "performance" | "balanced" | "lowvram" | "cloud";
-type ConnStatus = "idle" | "testing" | "ok" | "error";
 
 // ─── GPU Presets ─────────────────────────────────────────────
 const GPU_PRESETS: {
@@ -575,21 +573,6 @@ function FlagCategorySection({
   );
 }
 
-// ─── Connection Status Badge ──────────────────────────────────
-function StatusBadge({ status, message }: { status: ConnStatus; message: string }) {
-  if (status === "idle") return null;
-  const cfg = {
-    testing: { color: "text-yellow-400 bg-yellow-400/10 border-yellow-400/30", dot: "bg-yellow-400 animate-pulse" },
-    ok:      { color: "text-green-400 bg-green-400/10 border-green-400/30",   dot: "bg-green-400" },
-    error:   { color: "text-red-400 bg-red-400/10 border-red-400/30",         dot: "bg-red-400" },
-  }[status];
-  return (
-    <div className={`flex items-center gap-1.5 px-2 py-1 rounded border text-[10px] ${cfg.color}`}>
-      <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${cfg.dot}`} />
-      {message}
-    </div>
-  );
-}
 
 // ─── Main Connect Panel ──────────────────────────────────────
 export function ConnectPanel() {
@@ -602,9 +585,8 @@ export function ConnectPanel() {
   const [showScript, setShowScript] = useState(false);
   const [copiedScript, setCopiedScript] = useState(false);
   const [copiedLauncher, setCopiedLauncher] = useState<"bat" | "sh" | null>(null);
-  const [connStatus, setConnStatus] = useState<ConnStatus>("idle");
-  const [connMsg, setConnMsg] = useState("");
-  const [connDetail, setConnDetail] = useState<string | null>(null);
+  const { connStatus, connMsg, connDetail, handleTestConnection } =
+    useComfyUiConnection(agentPort, comfyPort);
 
   // ─── Flags helpers ─────────────────────────────────────────
   const handlePresetChange = (preset: GpuPreset) => {
@@ -812,56 +794,6 @@ wait
     setTimeout(() => setCopiedScript(false), 2000);
   };
 
-  // ─── Live connection test ─────────────────────────────────
-  const handleTestConnection = useCallback(async () => {
-    setConnStatus("testing");
-    setConnMsg("Connecting...");
-    setConnDetail(null);
-
-    const agentUrl = `http://127.0.0.1:${agentPort}`;
-    const directUrl = `http://127.0.0.1:${comfyPort}`;
-
-    // 1. Try the bridge agent first
-    try {
-      const res = await fetch(`${agentUrl}/health`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setConnStatus("ok");
-        setConnMsg(`Agent online — ComfyUI: ${data.comfy_url}`);
-        setConnDetail(`Set URL to ${agentUrl} in AI Panel`);
-        return;
-      }
-    } catch (_) {
-      // agent not running, try direct
-    }
-
-    // 2. Try direct ComfyUI
-    try {
-      const res = await fetch(`${directUrl}/system_stats`, {
-        signal: AbortSignal.timeout(4000),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const gpu = data.devices?.[0]?.name ?? "GPU";
-        setConnStatus("ok");
-        setConnMsg(`ComfyUI direct — ${gpu}`);
-        setConnDetail(`Set URL to ${directUrl} in AI Panel (Electron only)`);
-        return;
-      }
-    } catch (_) {
-      // neither reachable
-    }
-
-    setConnStatus("error");
-    setConnMsg("Not reachable");
-    setConnDetail(
-      `Agent (${agentUrl}/health) and ComfyUI (${directUrl}) both unreachable. ` +
-      "Start ComfyUI then run comfyui_agent.py."
-    );
-  }, [agentPort, comfyPort]);
-
   // ─── Render ───────────────────────────────────────────────
   return (
     <div className="flex flex-col gap-3">
@@ -880,84 +812,16 @@ wait
       </div>
 
       {/* ── Live test connection ───────────────────────────── */}
-      <div className="border border-border rounded-lg px-4 py-3 space-y-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Server className="w-3.5 h-3.5 text-primary" />
-            <span className="text-xs text-foreground">Test Connection</span>
-          </div>
-          <button
-            onClick={handleTestConnection}
-            disabled={connStatus === "testing"}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-60 transition-colors"
-          >
-            <RefreshCw className={`w-3 h-3 ${connStatus === "testing" ? "animate-spin" : ""}`} />
-            {connStatus === "testing" ? "Testing..." : "Test Now"}
-          </button>
-        </div>
-
-        {/* Port settings */}
-        <div className="grid grid-cols-2 gap-2">
-          <div>
-            <label className="text-[10px] text-muted-foreground uppercase tracking-wider block mb-1">
-              ComfyUI Port
-            </label>
-            <input
-              value={comfyPort}
-              onChange={(e) => setComfyPort(e.target.value.replace(/\D/g, ""))}
-              className="w-full bg-secondary text-foreground text-xs rounded-md px-2 py-1.5 border border-border focus:border-primary focus:outline-none font-mono"
-              placeholder="8188"
-              maxLength={5}
-            />
-          </div>
-          <div>
-            <label className="text-[10px] text-muted-foreground uppercase tracking-wider block mb-1">
-              Agent Port
-            </label>
-            <input
-              value={agentPort}
-              onChange={(e) => setAgentPort(e.target.value.replace(/\D/g, ""))}
-              className="w-full bg-secondary text-foreground text-xs rounded-md px-2 py-1.5 border border-border focus:border-primary focus:outline-none font-mono"
-              placeholder="8765"
-              maxLength={5}
-            />
-          </div>
-        </div>
-
-        {/* Status */}
-        {connStatus !== "idle" && (
-          <div className="space-y-1.5">
-            <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded-md border ${
-              connStatus === "ok"    ? "text-green-400 bg-green-400/10 border-green-400/20" :
-              connStatus === "error" ? "text-red-400 bg-red-400/10 border-red-400/20" :
-                                      "text-yellow-400 bg-yellow-400/10 border-yellow-400/20"
-            }`}>
-              {connStatus === "ok"    ? <Wifi className="w-3.5 h-3.5 shrink-0" /> :
-               connStatus === "error" ? <WifiOff className="w-3.5 h-3.5 shrink-0" /> :
-                                        <RefreshCw className="w-3.5 h-3.5 shrink-0 animate-spin" />}
-              {connMsg}
-            </div>
-            {connDetail && (
-              <div className="text-[10px] text-muted-foreground/70 px-1">
-                {connDetail}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Connection info box */}
-        <div className="bg-secondary/40 rounded-md px-3 py-2 space-y-1">
-          <div className="text-[10px] text-muted-foreground/60 uppercase tracking-wider">Use in AI Panel</div>
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground w-28 shrink-0">Via agent (browser):</span>
-            <code className="text-xs text-primary font-mono">http://127.0.0.1:{agentPort}</code>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] text-muted-foreground w-28 shrink-0">Direct (Electron):</span>
-            <code className="text-xs text-foreground/70 font-mono">http://127.0.0.1:{comfyPort}</code>
-          </div>
-        </div>
-      </div>
+      <ComfyEndpointSettings
+        comfyPort={comfyPort}
+        agentPort={agentPort}
+        connStatus={connStatus}
+        connMsg={connMsg}
+        connDetail={connDetail}
+        onChangeComfyPort={(value) => setComfyPort(value.replace(/\D/g, ""))}
+        onChangeAgentPort={(value) => setAgentPort(value.replace(/\D/g, ""))}
+        onTestConnection={handleTestConnection}
+      />
 
       {/* ── One-Click Launcher ────────────────────────────── */}
       <CollapsibleSection title="One-Click Launcher" icon={Rocket} defaultOpen={true}>
@@ -1083,24 +947,7 @@ wait
           </p>
 
           {/* Endpoints reference */}
-          <div className="bg-secondary/30 border border-border/50 rounded-md px-3 py-2.5 space-y-1">
-            <div className="text-[10px] text-muted-foreground/60 uppercase tracking-wider mb-1.5">Agent API endpoints</div>
-            {[
-              ["GET",  "/health",       "Agent + ComfyUI status"],
-              ["GET",  "/system_stats", "GPU / OS info from ComfyUI"],
-              ["GET",  "/object_info",  "Available models, samplers…"],
-              ["GET",  "/queue",        "Current queue status"],
-              ["POST", "/run_workflow", "Queue workflow JSON → returns images[]"],
-              ["POST", "/upload_image", "Upload base64 image → ComfyUI input folder"],
-              ["POST", "/interrupt",    "Stop current generation"],
-            ].map(([method, path, desc]) => (
-              <div key={path} className="flex items-start gap-2 text-[10px]">
-                <span className={`shrink-0 font-mono px-1 py-0.5 rounded text-[9px] ${method === "GET" ? "bg-blue-400/10 text-blue-400" : "bg-green-400/10 text-green-400"}`}>{method}</span>
-                <code className="text-foreground/70 font-mono shrink-0">{path}</code>
-                <span className="text-muted-foreground/60">{desc}</span>
-              </div>
-            ))}
-          </div>
+          <ComfyQueueRunControls />
 
           {/* Setup steps */}
           <div className="space-y-1.5">

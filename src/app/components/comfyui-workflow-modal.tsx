@@ -1,12 +1,7 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   X,
-  Upload,
-  ChevronRight,
-  ChevronDown,
   SlidersHorizontal,
-  Eye,
-  EyeOff,
   RefreshCw,
   Trash2,
   GripVertical,
@@ -16,7 +11,6 @@ import {
   Server,
   Search,
   Settings2,
-  Zap,
   Hash,
   Type,
   ToggleLeft,
@@ -25,6 +19,13 @@ import {
 } from "lucide-react";
 
 import { ConnectPanel } from "./comfyui-connect-panel";
+import { ComfyNodeBrowser } from "./comfyui-node-browser";
+import { ComfyWorkflowJsonEditor } from "./comfyui-workflow-json-editor";
+import {
+  getDefaultOptions,
+  guessParamType,
+  parseWorkflowText,
+} from "./comfyui-workflow-utils";
 
 // ─── Types ───────────────────────────────────────────────────
 export interface ComfyNode {
@@ -57,81 +58,6 @@ export interface ComfyWorkflowData {
   exposedParams: ExposedParam[];
 }
 
-// ─── Helpers ─────────────────────────────────────────────────
-const NODE_ICONS: Record<string, string> = {
-  KSampler: "⚡",
-  CheckpointLoaderSimple: "🔄",
-  CLIPTextEncode: "📝",
-  EmptyLatentImage: "🖼️",
-  VAEDecode: "🎨",
-  SaveImage: "💾",
-  LoraLoader: "🔗",
-  VAELoader: "🔧",
-  ControlNetLoader: "🎛️",
-  ControlNetApply: "🎯",
-  ImageScale: "📐",
-  ImageUpscaleWithModel: "🔎",
-};
-
-function getNodeIcon(classType: string) {
-  return NODE_ICONS[classType] || "📦";
-}
-
-function isConnection(value: unknown): boolean {
-  return Array.isArray(value) && value.length === 2 && typeof value[0] === "string";
-}
-
-function guessParamType(
-  fieldName: string,
-  value: unknown
-): Pick<ExposedParam, "type" | "min" | "max" | "step"> {
-  const name = fieldName.toLowerCase();
-  if (name === "seed") return { type: "seed" };
-  if (name === "steps" || name === "quality_steps")
-    return { type: "slider", min: 1, max: 100, step: 1 };
-  if (name === "cfg" || name === "cfg_scale" || name.includes("adherence"))
-    return { type: "slider", min: 1, max: 30, step: 0.5 };
-  if (name === "denoise" || name === "strength")
-    return { type: "slider", min: 0, max: 1, step: 0.01 };
-  if (name === "width" || name === "height")
-    return { type: "slider", min: 64, max: 4096, step: 64 };
-  if (
-    name === "sampler_name" ||
-    name === "scheduler" ||
-    name === "ckpt_name" ||
-    name === "lora_name" ||
-    name === "vae_name" ||
-    name === "control_net_name" ||
-    name === "upscale_method"
-  )
-    return { type: "select" };
-  if (typeof value === "boolean") return { type: "toggle" };
-  if (typeof value === "number")
-    return { type: "number" };
-  return { type: "text" };
-}
-
-function getSamplerOptions() {
-  return [
-    "euler", "euler_ancestral", "heun", "heunpp2", "dpm_2", "dpm_2_ancestral",
-    "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde",
-    "dpmpp_sde_gpu", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu",
-    "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", "ddpm", "lcm", "ddim", "uni_pc",
-    "uni_pc_bh2",
-  ];
-}
-
-function getSchedulerOptions() {
-  return ["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"];
-}
-
-function getDefaultOptions(fieldName: string): string[] | undefined {
-  const name = fieldName.toLowerCase();
-  if (name === "sampler_name") return getSamplerOptions();
-  if (name === "scheduler") return getSchedulerOptions();
-  return undefined;
-}
-
 const TYPE_ICON: Record<ExposedParam["type"], React.ElementType> = {
   slider: SlidersHorizontal,
   number: Hash,
@@ -140,193 +66,6 @@ const TYPE_ICON: Record<ExposedParam["type"], React.ElementType> = {
   seed: Shuffle,
   toggle: ToggleLeft,
 };
-
-// ─── Parse workflow ──────────────────────────────────────────
-function parseWorkflowJson(
-  json: Record<string, unknown>
-): ComfyNode[] {
-  const nodes: ComfyNode[] = [];
-  for (const [id, nodeData] of Object.entries(json)) {
-    const nd = nodeData as Record<string, unknown>;
-    if (nd.class_type && nd.inputs) {
-      nodes.push({
-        id,
-        class_type: nd.class_type as string,
-        inputs: nd.inputs as Record<string, unknown>,
-      });
-    }
-  }
-  return nodes;
-}
-
-// ─── Node Browser Panel ──────────────────────────────────────
-function NodeBrowser({
-  nodes,
-  exposedParams,
-  onToggleExpose,
-  searchQuery,
-}: {
-  nodes: ComfyNode[];
-  exposedParams: ExposedParam[];
-  onToggleExpose: (nodeId: string, fieldName: string, value: unknown) => void;
-  searchQuery: string;
-}) {
-  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
-
-  const toggleNode = (nodeId: string) => {
-    setExpandedNodes((prev) => {
-      const next = new Set(prev);
-      next.has(nodeId) ? next.delete(nodeId) : next.add(nodeId);
-      return next;
-    });
-  };
-
-  const expandAll = () => setExpandedNodes(new Set(nodes.map((n) => n.id)));
-  const collapseAll = () => setExpandedNodes(new Set());
-
-  const isExposed = (nodeId: string, fieldName: string) =>
-    exposedParams.some((p) => p.nodeId === nodeId && p.fieldName === fieldName);
-
-  const filteredNodes = searchQuery
-    ? nodes.filter(
-        (n) =>
-          n.class_type.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          Object.keys(n.inputs).some((k) =>
-            k.toLowerCase().includes(searchQuery.toLowerCase())
-          )
-      )
-    : nodes;
-
-  return (
-    <div className="flex flex-col h-full">
-      <div className="flex items-center gap-2 mb-2">
-        <button
-          onClick={expandAll}
-          className="text-[10px] text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded bg-secondary/50"
-        >
-          Expand All
-        </button>
-        <button
-          onClick={collapseAll}
-          className="text-[10px] text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded bg-secondary/50"
-        >
-          Collapse All
-        </button>
-        <span className="text-[10px] text-muted-foreground ml-auto">
-          Click field to expose
-        </span>
-      </div>
-      <div className="flex-1 overflow-y-auto space-y-1">
-        {filteredNodes.map((node) => {
-          const fields = Object.entries(node.inputs).filter(
-            ([, v]) => !isConnection(v)
-          );
-          const exposedCount = fields.filter(([k]) =>
-            isExposed(node.id, k)
-          ).length;
-          const isExpanded = expandedNodes.has(node.id);
-
-          return (
-            <div
-              key={node.id}
-              className="border border-border rounded-md overflow-hidden"
-            >
-              {/* Node header */}
-              <button
-                onClick={() => toggleNode(node.id)}
-                className="w-full flex items-center gap-2 px-2.5 py-2 hover:bg-accent/50 transition-colors"
-              >
-                {isExpanded ? (
-                  <ChevronDown className="w-3 h-3 text-muted-foreground shrink-0" />
-                ) : (
-                  <ChevronRight className="w-3 h-3 text-muted-foreground shrink-0" />
-                )}
-                <span className="text-sm">{getNodeIcon(node.class_type)}</span>
-                <span className="text-xs text-muted-foreground">#{node.id}</span>
-                <span className="text-xs text-foreground">{node.class_type}</span>
-                <span className="text-[10px] text-muted-foreground ml-auto">
-                  {fields.length} fields
-                </span>
-                {exposedCount > 0 && (
-                  <span className="text-[10px] bg-primary/20 text-primary px-1.5 py-0.5 rounded">
-                    {exposedCount} exposed
-                  </span>
-                )}
-              </button>
-
-              {/* Node fields */}
-              {isExpanded && (
-                <div className="border-t border-border">
-                  {fields.length === 0 ? (
-                    <div className="px-3 py-2 text-xs text-muted-foreground">
-                      No exposable fields
-                    </div>
-                  ) : (
-                    fields.map(([fieldName, value]) => {
-                      const exposed = isExposed(node.id, fieldName);
-                      return (
-                        <button
-                          key={fieldName}
-                          onClick={() =>
-                            onToggleExpose(node.id, fieldName, value)
-                          }
-                          className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
-                            exposed
-                              ? "bg-primary/10 hover:bg-primary/15"
-                              : "hover:bg-accent/30"
-                          }`}
-                        >
-                          {exposed ? (
-                            <Eye className="w-3 h-3 text-primary shrink-0" />
-                          ) : (
-                            <EyeOff className="w-3 h-3 text-muted-foreground/40 shrink-0" />
-                          )}
-                          <span
-                            className={`${
-                              exposed ? "text-primary" : "text-foreground"
-                            }`}
-                          >
-                            {fieldName}
-                          </span>
-                          <span className="text-muted-foreground ml-auto truncate max-w-[140px]">
-                            {typeof value === "string"
-                              ? `"${value.length > 20 ? value.slice(0, 20) + "..." : value}"`
-                              : String(value)}
-                          </span>
-                          {exposed && (
-                            <span className="text-[9px] bg-primary text-primary-foreground px-1 rounded uppercase">
-                              {guessParamType(fieldName, value).type}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })
-                  )}
-
-                  {/* Show connections (dimmed) */}
-                  {Object.entries(node.inputs)
-                    .filter(([, v]) => isConnection(v))
-                    .map(([fieldName, value]) => (
-                      <div
-                        key={fieldName}
-                        className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground/30"
-                      >
-                        <Zap className="w-3 h-3 shrink-0" />
-                        <span>{fieldName}</span>
-                        <span className="ml-auto">
-                          → node {(value as string[])[0]}
-                        </span>
-                      </div>
-                    ))}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
 
 // ─── Exposed Params Panel ────────────────────────────────────
 function ExposedParamsPanel({
@@ -730,7 +469,6 @@ export function ComfyWorkflowModal({
   const [workflowName, setWorkflowName] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [runValues, setRunValues] = useState<Record<string, unknown>>({});
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (isOpen && workflow) {
@@ -746,45 +484,28 @@ export function ComfyWorkflowModal({
     }
   }, [isOpen, workflow]);
 
-  const handleFileImport = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const text = reader.result as string;
-        setJsonText(text);
-        tryParseJson(text);
-      };
-      reader.readAsText(file);
-      // Reset so same file can be re-imported
-      e.target.value = "";
-    },
-    []
-  );
-
-  const tryParseJson = (text: string) => {
-    try {
-      const json = JSON.parse(text);
-      const nodes = parseWorkflowJson(json);
-      if (nodes.length === 0) {
-        setParseError("No valid ComfyUI nodes found in JSON.");
-        return;
-      }
-      setParseError(null);
-      const name = workflowName || `Workflow ${Date.now().toString(36)}`;
-      const wf: ComfyWorkflowData = {
-        id: `wf-${Date.now()}`,
-        name,
-        description: `${nodes.length} nodes`,
-        nodes,
-        rawJson: json,
-        exposedParams: [],
-      };
-      onSetWorkflow(wf);
+  const handleImportText = (text: string) => {
+    setJsonText(text);
+    const { workflow: parsedWorkflow, error } = parseWorkflowText(
+      text,
+      workflowName
+    );
+    setParseError(error);
+    if (parsedWorkflow) {
+      onSetWorkflow(parsedWorkflow);
       setActiveTab("nodes");
-    } catch {
-      setParseError("Invalid JSON. Please paste a valid ComfyUI API JSON.");
+    }
+  };
+
+  const handleParseJson = () => {
+    const { workflow: parsedWorkflow, error } = parseWorkflowText(
+      jsonText,
+      workflowName
+    );
+    setParseError(error);
+    if (parsedWorkflow) {
+      onSetWorkflow(parsedWorkflow);
+      setActiveTab("nodes");
     }
   };
 
@@ -927,57 +648,15 @@ export function ComfyWorkflowModal({
         <div className="flex-1 overflow-hidden p-4">
           {/* JSON Tab */}
           {activeTab === "json" && (
-            <div className="flex flex-col h-full gap-3">
-              <div className="flex items-center gap-2">
-                <input
-                  value={workflowName}
-                  onChange={(e) => setWorkflowName(e.target.value)}
-                  placeholder="Workflow name (optional)"
-                  className="flex-1 bg-secondary text-foreground text-xs rounded-md px-3 py-2 border border-border focus:border-primary focus:outline-none"
-                />
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="flex items-center gap-1.5 px-3 py-2 bg-primary/10 text-primary text-xs rounded-md border border-primary/20 hover:bg-primary/20 transition-colors"
-                >
-                  <Upload className="w-3.5 h-3.5" />
-                  Import JSON File
-                </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".json"
-                  onChange={handleFileImport}
-                  className="hidden"
-                />
-              </div>
-
-              <div className="text-xs text-muted-foreground">
-                Paste your ComfyUI workflow JSON (API format). Export from
-                ComfyUI → Save (API Format).
-              </div>
-
-              <textarea
-                value={jsonText}
-                onChange={(e) => setJsonText(e.target.value)}
-                placeholder='{ "3": { "class_type": "KSampler", "inputs": { ... } }, ... }'
-                className="flex-1 bg-background text-foreground text-xs font-mono rounded-md px-3 py-2 border border-border focus:border-primary focus:outline-none resize-none"
-              />
-
-              {parseError && (
-                <div className="text-xs text-destructive bg-destructive/10 border border-destructive/20 rounded-md px-3 py-2">
-                  {parseError}
-                </div>
-              )}
-
-              <button
-                onClick={() => tryParseJson(jsonText)}
-                disabled={!jsonText.trim()}
-                className="self-end flex items-center gap-1.5 px-4 py-2 bg-primary text-primary-foreground text-xs rounded-md hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                <FileJson className="w-3.5 h-3.5" />
-                Parse Workflow
-              </button>
-            </div>
+            <ComfyWorkflowJsonEditor
+              workflowName={workflowName}
+              jsonText={jsonText}
+              parseError={parseError}
+              onWorkflowNameChange={setWorkflowName}
+              onJsonTextChange={setJsonText}
+              onImportText={handleImportText}
+              onParse={handleParseJson}
+            />
           )}
 
           {/* Node Browser Tab */}
@@ -993,7 +672,7 @@ export function ComfyWorkflowModal({
                 />
               </div>
               <div className="flex-1 overflow-hidden">
-                <NodeBrowser
+                <ComfyNodeBrowser
                   nodes={workflow.nodes}
                   exposedParams={workflow.exposedParams}
                   onToggleExpose={handleToggleExpose}

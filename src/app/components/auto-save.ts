@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import { useEditor } from "./editor-store";
+import { useEditorSelector } from "./editor-store";
+import { useShallow } from "zustand/react/shallow";
 import { serializeProject, type ProjectFile } from "./project-io";
 
 const AUTO_SAVE_KEY = "ai-canvas:auto-save:v1";
@@ -27,7 +28,15 @@ export function clearAutoSavedProject() {
 }
 
 export function useAutoSave() {
-  const { layers, canvasWidth, canvasHeight, activeLayerId, selection } = useEditor();
+  const { layers, canvasWidth, canvasHeight, activeLayerId, selection } = useEditorSelector(
+    useShallow((s) => ({
+      layers: s.layers,
+      canvasWidth: s.canvasWidth,
+      canvasHeight: s.canvasHeight,
+      activeLayerId: s.activeLayerId,
+      selection: s.selection,
+    }))
+  );
   const latestStateRef = useRef({
     layers,
     canvasWidth,
