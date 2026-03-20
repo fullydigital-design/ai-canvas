@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-03-20 - README polish for GitHub presentation
+
+### Changed
+- `README.md`
+  - replaced minimal placeholder text with a complete project overview
+  - added highlights, stack, quick-start, build/release commands, and Blender feature-flag guidance
+  - documented included Git helper scripts and key repository docs.
+
+---
+
 ## 2026-03-20 - GitHub repo prep + upload/download helpers
 
 ### Added
