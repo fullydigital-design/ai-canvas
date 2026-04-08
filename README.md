@@ -4,6 +4,8 @@ A Windows-first desktop creative editor built with Electron, React, and TypeScri
 
 AI Canvas combines a high-performance 2D workflow with an optional Blender bridge for 3D-assisted pipelines.
 
+![AI Canvas Screenshot](docs/screenshot.png)
+
 ## Highlights
 
 - Infinite canvas editing with layered workflows.

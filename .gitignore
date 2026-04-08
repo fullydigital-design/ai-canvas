@@ -9,3 +9,19 @@ desktop.ini
 *.AppImage
 *.deb
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment files
+.env
+.env.*
+
+# Docs (keep only non-markdown assets public)
+docs/*.md
+
+# Internal session / agent files
+Start_end_session.txt
+AGENTS.md
