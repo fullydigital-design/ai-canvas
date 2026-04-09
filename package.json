@@ -1,6 +1,7 @@
 {
   "name": "ai-canvas-editor",
   "private": true,
+  "description": "Desktop image editor with WebGL rendering, ComfyUI integration, and live Blender bridge. Electron-based, offline-first.",
   "version": "1.0.0",
   "main": "electron/main.cjs",
   "type": "module",

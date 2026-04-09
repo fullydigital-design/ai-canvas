@@ -25,3 +25,5 @@ docs/*.md
 # Internal session / agent files
 Start_end_session.txt
 AGENTS.md
+project-state.yaml
+_github_upload_download/
