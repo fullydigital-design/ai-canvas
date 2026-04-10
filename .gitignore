@@ -21,9 +21,29 @@ __pycache__/
 
 # Docs (keep only non-markdown assets public)
 docs/*.md
+!docs/ARCHITECTURE.md
 
 # Internal session / agent files
 Start_end_session.txt
 AGENTS.md
 project-state.yaml
 _github_upload_download/
+
+# Python cache
+blender_addon/__pycache__/
+blender_addon/*.pyc
+blender_addon/*.pyo
+
+# Git helper scripts (internal)
+git_*.bat
+github_login.bat
+
+# Build helpers
+build_portable.bat
+start_launch_app.bat
+Start_end_session.txt
+
+# Editor internals
+.cursor/
+.cursorrules
+cursor-instructions
