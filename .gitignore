@@ -42,8 +42,3 @@ github_login.bat
 build_portable.bat
 start_launch_app.bat
 Start_end_session.txt
-
-# Editor internals
-.cursor/
-.cursorrules
-cursor-instructions
